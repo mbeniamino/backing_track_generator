@@ -663,3 +663,56 @@ def test_theme_applies(qapp):
     win = make_window()
     win.grab()
     win.close()
+
+
+# ----- model updates -------------------------------------------------------------
+
+def test_check_model_updates_flow(qapp, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from backing_track_generator.model_update import ModelUpdateError, ModelUpdateInfo
+    from backing_track_generator.ui import main_window
+
+    shown, downloads = [], []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a: shown.append(("info", a[2])))
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a: shown.append(("warn", a[2])))
+    answers = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: (shown.append(("ask", a[2])), answers.pop(0))[1])
+
+    def info(**kw):
+        base = dict(model="htdemucs_6s", repo_id="adefossez/HTDemucs-6s", downloaded=True,
+                    local_revision="a" * 40, remote_revision="b" * 40)
+        return ModelUpdateInfo(**{**base, **kw})
+
+    def run(result):
+        def check(model):
+            if isinstance(result, Exception):
+                raise result
+            return result
+        monkeypatch.setattr(main_window, "check_for_update", check)
+        monkeypatch.setattr(main_window, "download_latest", lambda m: downloads.append(m) or "c" * 40)
+        shown.clear()
+        win.act_check_model.trigger()
+        assert not win.act_check_model.isEnabled()
+        wait_until(qapp, lambda: win._model_task is None and shown, timeout=5)
+
+    win = make_window()
+    run(info())
+    assert shown == [("info", "The separation model is up to date (revision aaaaaaaa).")]
+    assert win.act_check_model.isEnabled()
+
+    run(info(downloaded=False, local_revision=None))
+    assert "hasn't been downloaded yet" in shown[0][1]
+
+    run(ModelUpdateError("Could not reach Hugging Face"))
+    assert shown == [("warn", "Could not reach Hugging Face")]
+
+    answers.append(QMessageBox.StandardButton.No)
+    run(info(changed_files=["5c90dfd2.safetensors"], download_bytes=55_000_000))
+    assert shown[0][0] == "ask" and "about 55 MB" in shown[0][1] and downloads == []
+
+    answers.append(QMessageBox.StandardButton.Yes)
+    run(info(changed_files=["5c90dfd2.safetensors"]))
+    wait_until(qapp, lambda: downloads and len(shown) == 2 and win._model_task is None, timeout=5)
+    assert downloads == ["htdemucs_6s"] and "updated (revision cccccccc)" in shown[1][1]
+    win.close()

@@ -22,11 +22,13 @@ from PySide6.QtWidgets import (
 
 from ..audio_io import AudioLoadError, load_audio
 from ..engine import AudioEngine, Track
+from ..model_update import ModelUpdateInfo, check_for_update, download_latest
 from ..project import ProjectError, ProjectSettings, TrackSettings, is_project, load_project, save_project
 from ..render import FILE_FILTERS, FORMATS, RenderError, render_mix
 from ..separation import DEFAULT_MODEL, SeparationError, cache_dir_for, is_cached, load_stems
 from ..timefmt import format_time
 from ..transpose import MAX_SEMITONES, MIN_SEMITONES, TranspositionCache
+from .background import BackgroundCall
 from .separation_job import SeparationJob
 from .timeline import TimeRuler, Timeline
 from . import theme
@@ -81,6 +83,7 @@ class MainWindow(QMainWindow):
         self._project_extra: dict = {}
         self._dirty = False
         self._last_render_dir: Path | None = None
+        self._model_task: BackgroundCall | None = None
         self._separated = False
         self._job: SeparationJob | None = None
         # Transposition: originals + cached versions for the current track set.
@@ -172,6 +175,10 @@ class MainWindow(QMainWindow):
         self.act_render_loop = QAction("Render &loop region…", self)
         self.act_render_loop.triggered.connect(lambda: self.render_to_file(loop_only=True))
 
+        self.act_check_model = QAction("Check for separation model &updates…", self)
+        self.act_check_model.setToolTip("Check Hugging Face for a newer version of the Demucs model")
+        self.act_check_model.triggered.connect(self.check_model_updates)
+
         self.act_quit = QAction("&Quit", self)
         self.act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         self.act_quit.triggered.connect(self.close)
@@ -190,6 +197,8 @@ class MainWindow(QMainWindow):
         tracks_menu = self.menuBar().addMenu("T&racks")
         tracks_menu.addAction(self.act_separate)
         tracks_menu.addAction(self.act_reset_ms)
+        tracks_menu.addSeparator()
+        tracks_menu.addAction(self.act_check_model)
         transport_menu = self.menuBar().addMenu("&Transport")
         transport_menu.addAction(self.act_play)
         transport_menu.addAction(self.act_stop)
@@ -479,6 +488,67 @@ class MainWindow(QMainWindow):
             ext = selected[selected.find("*") + 1: selected.find(")")] if "*" in selected else ".wav"
             path = path.with_name(path.name + ext)
         return path
+
+    # ----- model updates -----------------------------------------------------
+
+    def check_model_updates(self) -> None:
+        """Ask Hugging Face whether the separation model has a newer version and
+        offer to download it. Separation itself never goes online once the model
+        is downloaded, so this is the only way updates arrive."""
+        if self._model_task is not None:
+            return
+        self._start_model_task(check_for_update, DEFAULT_MODEL, self._on_model_checked,
+                               "Checking for separation model updates…")
+
+    def _start_model_task(self, fn, arg, on_finished, message: str) -> None:
+        task = BackgroundCall(fn, arg, parent=self)
+        task.finished.connect(on_finished)
+        task.failed.connect(self._on_model_task_failed)
+        task.done.connect(self._on_model_task_done)
+        task.done.connect(task.deleteLater)
+        self._model_task = task
+        self.act_check_model.setEnabled(False)
+        self.statusBar().showMessage(message)
+        task.start()
+
+    def _on_model_task_done(self) -> None:
+        self._model_task = None
+        self.act_check_model.setEnabled(True)
+
+    def _on_model_task_failed(self, message: str) -> None:
+        self.statusBar().clearMessage()
+        QMessageBox.warning(self, "Model update", message)
+
+    def _on_model_checked(self, info: ModelUpdateInfo) -> None:
+        self.statusBar().clearMessage()
+        if not info.downloaded:
+            QMessageBox.information(
+                self, "Model update",
+                f"The separation model ({info.repo_id}) hasn't been downloaded yet.\n"
+                "It will be downloaded automatically the first time a song is separated.")
+            return
+        if not info.update_available:
+            QMessageBox.information(
+                self, "Model update",
+                f"The separation model is up to date (revision {info.local_revision[:8]}).")
+            return
+        size = f" (about {info.download_bytes / 1e6:.0f} MB)" if info.download_bytes else ""
+        answer = QMessageBox.question(
+            self, "Model update",
+            f"A newer version of the separation model is available{size}.\n\n"
+            f"Installed: {info.local_revision[:8]}   Latest: {info.remote_revision[:8]}\n"
+            f"Changed files: {', '.join(info.changed_files)}\n\n"
+            "Download it now? Songs separated before keep their current tracks.")
+        if answer == QMessageBox.StandardButton.Yes:
+            # _on_model_task_done for the check runs after this slot; start on the next turn.
+            QTimer.singleShot(0, lambda: self._start_model_task(
+                download_latest, info.model, self._on_model_downloaded, "Downloading separation model update…"))
+
+    def _on_model_downloaded(self, revision: str) -> None:
+        self.statusBar().showMessage(f"Separation model updated to revision {revision[:8]}", 8000)
+        QMessageBox.information(self, "Model update",
+                                f"The separation model was updated (revision {revision[:8]}).\n"
+                                "It will be used for songs separated from now on.")
 
     def _on_open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -834,6 +904,8 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             event.ignore()
             return
+        if self._model_task is not None:
+            self._model_task.wait(1)  # a network call; don't block closing for long
         self.cancel_separation()
         job = self._transpose_job
         self._cancel_transpose_job()
