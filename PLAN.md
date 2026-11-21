@@ -51,7 +51,7 @@ app/
 1. ✅ Skeleton: open file, play/stop, click-to-seek, one waveform.
 2. ✅ Separation: Demucs in a background process with status-bar progress + cancel; stem cache in ~/.cache/backing-track-generator/stems (keyed by file hash + model).
 3. ✅ Multi-track lanes on a shared timeline + Mute/Solo (Ctrl+click = exclusive solo, 10 ms click-free gain ramps, inaudible lanes greyed).
-4. Loop A/B points.
+4. ✅ Loop: drag on ruler (edges adjustable), L toggles, [ ] set at playhead; 10 ms equal-power crossfade at wrap and on seek-while-playing.
 5. Transpose (±N semitones) with caching.
 6. Project save/load.
 7. Render current mix to a single file.

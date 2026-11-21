@@ -202,3 +202,125 @@ def test_soloed_mix_after_ramp():
     out = np.zeros((50, 2), np.float32)
     eng.render_block(out)
     np.testing.assert_allclose(out[20:], 0.2, rtol=1e-5)  # only b once a has faded
+
+
+# ----- loop ------------------------------------------------------------------
+
+def ramp_track(frames):
+    """Each frame's value is its index / frames, so output reveals the read position."""
+    v = (np.arange(frames, dtype=np.float32) / frames)[:, None]
+    return Track("r", np.repeat(v, 2, axis=1))
+
+
+def sine_engine(sr=8000, seconds=1.0, freq=100.0):
+    t = np.arange(int(sr * seconds)) / sr
+    data = np.repeat((0.5 * np.sin(2 * np.pi * freq * t)).astype(np.float32)[:, None], 2, axis=1)
+    eng = AudioEngine(use_device=False)
+    eng.load([Track("s", data)], sr)
+    return eng
+
+
+def render(eng, frames, block=64):
+    """Render exactly ``frames`` frames (the last block may be shorter)."""
+    chunks = []
+    while frames > 0:
+        out = np.zeros((min(block, frames), 2), np.float32)
+        eng.render_block(out)
+        chunks.append(out)
+        frames -= out.shape[0]
+    return np.concatenate(chunks)
+
+
+def test_loop_wraps_and_stays_inside():
+    eng = make_engine(ramp_track(1000))  # SR=1000
+    eng.set_loop(0.2, 0.5)
+    eng.seek(0.2)
+    eng.play()
+    positions = []
+    for _ in range(50):
+        render(eng, 37, block=37)  # block size not aligned with the loop
+        positions.append(eng.position)
+    assert eng.is_playing
+    assert all(0.2 <= p < 0.5 for p in positions)
+    assert len(set(round(p, 3) for p in positions)) > 5
+
+
+def test_loop_audio_after_crossfade_is_from_loop_start():
+    eng = make_engine(ramp_track(1000))  # crossfade = 10 frames at SR=1000
+    eng.set_loop(0.2, 0.5)
+    eng.seek(0.2)
+    eng.play()
+    out = render(eng, 400, block=400)
+    np.testing.assert_allclose(out[:300, 0], np.arange(200, 500) / 1000, atol=1e-6)
+    # After the 10-frame crossfade, reading resumes at loop start + 10.
+    np.testing.assert_allclose(out[310:400, 0], np.arange(210, 300) / 1000, atol=1e-6)
+
+
+def test_play_from_before_loop_enters_it_and_past_it_plays_out():
+    eng = make_engine(ramp_track(1000))
+    eng.set_loop(0.3, 0.6)
+    eng.play()  # from 0: reaches 0.6 then wraps
+    render(eng, 700)
+    assert 0.3 <= eng.position < 0.6
+    eng.seek(0.8)  # past the loop end: no wrap
+    render(eng, 300)
+    assert not eng.is_playing and eng.position == pytest.approx(1.0)
+
+
+def test_loop_disabled_or_too_short_does_not_wrap():
+    eng = make_engine(ramp_track(1000))
+    eng.set_loop(0.2, 0.5, enabled=False)
+    eng.play()
+    render(eng, 600)
+    assert eng.position == pytest.approx(0.6)
+    eng.set_loop(0.7, 0.75)  # 50 ms < MIN_LOOP_SECONDS
+    assert not eng.loop_active
+    render(eng, 400)
+    assert not eng.is_playing
+
+
+def test_set_loop_normalises_order_and_clamps():
+    eng = make_engine(ramp_track(1000))
+    eng.set_loop(5.0, 0.4)
+    assert eng.loop_active
+    eng.seek(0.4)
+    eng.play()
+    render(eng, 2000)
+    assert 0.4 <= eng.position < 1.0 and eng.is_playing
+
+
+def test_stop_rewinds_to_loop_start_when_looping():
+    eng = make_engine(ramp_track(1000))
+    eng.set_loop(0.3, 0.6)
+    eng.seek(0.45)
+    eng.stop()
+    assert eng.position == pytest.approx(0.3)
+    eng.set_loop_enabled(False)
+    eng.stop()
+    assert eng.position == 0
+
+
+def max_step(x):
+    return float(np.abs(np.diff(x)).max())
+
+
+def test_loop_wrap_has_no_discontinuity():
+    eng = sine_engine()
+    eng.play()
+    natural = max_step(render(eng, 100)[:, 0])
+    eng.stop()
+    eng.set_loop(0.1, 0.3537)  # not a whole number of cycles: hard jump without crossfade
+    eng.seek(0.1)
+    eng.play()
+    out = render(eng, 8000 * 2)[:, 0]
+    assert max_step(out) < 1.5 * natural  # a hard cut would jump by up to ~1.0
+
+
+def test_seek_while_playing_is_crossfaded():
+    eng = sine_engine()
+    eng.play()
+    a = render(eng, 1000)[:, 0]
+    natural = max_step(a)
+    eng.seek(0.6123)
+    b = render(eng, 1000)[:, 0]
+    assert max_step(np.concatenate([a, b])) < 1.5 * natural

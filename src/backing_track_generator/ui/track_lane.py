@@ -84,6 +84,7 @@ class WaveformView(TimelineWidget):
             self._cache = self._render_cache()
         p = QPainter(self)
         p.drawPixmap(0, 0, self._cache)
+        self.paint_loop(p)
         x = self.playhead_x()
         p.setPen(PLAYHEAD_COLOR)
         p.drawLine(QLineF(x, 0, x, self.height()))

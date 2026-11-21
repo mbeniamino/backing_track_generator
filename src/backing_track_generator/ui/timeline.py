@@ -1,31 +1,46 @@
-"""Shared timeline state and the time ruler widget."""
+"""Shared timeline state (duration, playhead, loop) and the time ruler widget."""
 
 from __future__ import annotations
+
+from enum import Enum, auto
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPolygonF
 from PySide6.QtWidgets import QWidget
 
+from ..engine import MIN_LOOP_SECONDS
 from ..timefmt import format_time
 
 PLAYHEAD_COLOR = QColor("#ff5252")
+LOOP_COLOR = QColor("#ff9800")
+LOOP_FILL_ENABLED = QColor(255, 152, 0, 45)
+LOOP_FILL_DISABLED = QColor(128, 128, 128, 35)
 
 # Candidate tick spacings in seconds; the smallest one giving enough room is used.
 _TICK_STEPS = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600]
 _MIN_TICK_PX = 70
+_EDGE_GRAB_PX = 5  # how close to a loop edge a press grabs it
+_DRAG_THRESHOLD_PX = 3  # movement that turns a ruler click into a loop drag
 
 
 class Timeline(QObject):
-    """Time axis shared by the ruler and all track lanes."""
+    """Time axis shared by the ruler and all track lanes.
+
+    The loop is stored even when disabled so it can be toggled back on.
+    ``loop`` is None when no region has been set.
+    """
 
     durationChanged = Signal(float)
     positionChanged = Signal(float)
     seekRequested = Signal(float)
+    loopChanged = Signal()
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._duration = 0.0
         self._position = 0.0
+        self._loop: tuple[float, float] | None = None
+        self._loop_enabled = False
 
     @property
     def duration(self) -> float:
@@ -37,14 +52,49 @@ class Timeline(QObject):
 
     def set_duration(self, seconds: float) -> None:
         self._duration = max(seconds, 0.0)
+        self._loop = None
+        self._loop_enabled = False
         self.durationChanged.emit(self._duration)
+        self.loopChanged.emit()
 
     def set_position(self, seconds: float) -> None:
         if seconds != self._position:
             self._position = seconds
             self.positionChanged.emit(seconds)
 
-    # x <-> time mapping for a widget of a given width
+    # ----- loop ----------------------------------------------------------
+
+    @property
+    def loop(self) -> tuple[float, float] | None:
+        return self._loop
+
+    @property
+    def loop_enabled(self) -> bool:
+        return self._loop_enabled and self.loop_valid
+
+    @property
+    def loop_valid(self) -> bool:
+        return self._loop is not None and self._loop[1] - self._loop[0] >= MIN_LOOP_SECONDS
+
+    def set_loop(self, start: float, end: float, enabled: bool | None = None) -> None:
+        a, b = sorted((start, end))
+        self._loop = (min(max(a, 0.0), self._duration), min(max(b, 0.0), self._duration))
+        if enabled is not None:
+            self._loop_enabled = enabled
+        self.loopChanged.emit()
+
+    def set_loop_enabled(self, enabled: bool) -> None:
+        if enabled != self._loop_enabled:
+            self._loop_enabled = enabled
+            self.loopChanged.emit()
+
+    def clear_loop(self) -> None:
+        self._loop = None
+        self._loop_enabled = False
+        self.loopChanged.emit()
+
+    # ----- x <-> time mapping for a widget of a given width ------------------
+
     def x_to_time(self, x: float, width: int) -> float:
         if width <= 0 or self._duration <= 0:
             return 0.0
@@ -57,13 +107,15 @@ class Timeline(QObject):
 
 
 class TimelineWidget(QWidget):
-    """Base for widgets drawn on the timeline: click/drag to seek, playhead updates."""
+    """Base for widgets drawn on the timeline: click/drag to seek, playhead and
+    loop region updates."""
 
     def __init__(self, timeline: Timeline, parent: QWidget | None = None):
         super().__init__(parent)
         self.timeline = timeline
         timeline.positionChanged.connect(self.update)
         timeline.durationChanged.connect(self.update)
+        timeline.loopChanged.connect(self.update)
         self.setCursor(Qt.CursorShape.IBeamCursor)
 
     def mousePressEvent(self, event):
@@ -78,14 +130,98 @@ class TimelineWidget(QWidget):
         if self.timeline.duration > 0:
             self.timeline.seekRequested.emit(self.timeline.x_to_time(x, self.width()))
 
+    def x_of(self, t: float) -> float:
+        return self.timeline.time_to_x(t, self.width())
+
     def playhead_x(self) -> float:
-        return self.timeline.time_to_x(self.timeline.position, self.width())
+        return self.x_of(self.timeline.position)
+
+    def paint_loop(self, p: QPainter, edges: bool = True) -> None:
+        """Shade the loop region (orange when enabled, grey when disabled)."""
+        loop = self.timeline.loop
+        if loop is None:
+            return
+        x0, x1 = self.x_of(loop[0]), self.x_of(loop[1])
+        enabled = self.timeline.loop_enabled
+        p.fillRect(QRectF(x0, 0, x1 - x0, self.height()), LOOP_FILL_ENABLED if enabled else LOOP_FILL_DISABLED)
+        if edges:
+            color = QColor(LOOP_COLOR)
+            if not enabled:
+                color.setAlpha(90)
+            p.setPen(color)
+            for x in (x0, x1):
+                p.drawLine(QPointF(x, 0), QPointF(x, self.height()))
+
+
+class _Drag(Enum):
+    NONE = auto()
+    PENDING = auto()  # pressed, not moved enough yet: a release seeks
+    NEW = auto()  # dragging out a new loop region
+    START = auto()  # moving the loop start edge
+    END = auto()  # moving the loop end edge
 
 
 class TimeRuler(TimelineWidget):
+    """Time ruler. Click: seek. Drag: create a loop region. Drag an edge of the
+    loop: adjust it."""
+
     def __init__(self, timeline: Timeline, parent: QWidget | None = None):
         super().__init__(timeline, parent)
         self.setFixedHeight(24)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setToolTip("Click to jump · drag to set a loop · drag loop edges to adjust")
+        self._drag = _Drag.NONE
+        self._anchor_x = 0.0
+
+    def _edge_at(self, x: float) -> _Drag:
+        loop = self.timeline.loop
+        if loop is None:
+            return _Drag.NONE
+        d0, d1 = abs(x - self.x_of(loop[0])), abs(x - self.x_of(loop[1]))
+        if min(d0, d1) > _EDGE_GRAB_PX:
+            return _Drag.NONE
+        return _Drag.START if d0 <= d1 else _Drag.END
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or self.timeline.duration <= 0:
+            return
+        x = event.position().x()
+        edge = self._edge_at(x)
+        self._drag = edge if edge is not _Drag.NONE else _Drag.PENDING
+        self._anchor_x = x
+
+    def mouseMoveEvent(self, event):
+        x = event.position().x()
+        tl = self.timeline
+        if self._drag is _Drag.NONE:
+            near_edge = self._edge_at(x) is not _Drag.NONE
+            self.setCursor(Qt.CursorShape.SizeHorCursor if near_edge else Qt.CursorShape.ArrowCursor)
+            return
+        t = tl.x_to_time(x, self.width())
+        if self._drag is _Drag.PENDING and abs(x - self._anchor_x) >= _DRAG_THRESHOLD_PX:
+            self._drag = _Drag.NEW
+        if self._drag is _Drag.NEW:
+            tl.set_loop(tl.x_to_time(self._anchor_x, self.width()), t, enabled=True)
+        elif self._drag in (_Drag.START, _Drag.END):
+            start, end = tl.loop
+            if self._drag is _Drag.START:
+                start = t
+            else:
+                end = t
+            if start > end:  # dragged one edge past the other: swap roles
+                self._drag = _Drag.END if self._drag is _Drag.START else _Drag.START
+            tl.set_loop(start, end)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        drag, self._drag = self._drag, _Drag.NONE
+        if drag is _Drag.PENDING:
+            self._seek_to(event.position().x())
+        elif drag is _Drag.NEW and not self.timeline.loop_valid:
+            self.timeline.clear_loop()  # too short to be a loop: treat as a click
+            self._seek_to(event.position().x())
 
     def paintEvent(self, event):  # noqa: ARG002
         p = QPainter(self)
@@ -97,10 +233,25 @@ class TimeRuler(TimelineWidget):
         if duration <= 0:
             return
 
+        self.paint_loop(p, edges=False)
+        loop = self.timeline.loop
+        if loop is not None:
+            # Edge handles: small flags at the top of the ruler.
+            color = QColor(LOOP_COLOR)
+            if not self.timeline.loop_enabled:
+                color.setAlpha(110)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(color)
+            x0, x1 = self.x_of(loop[0]), self.x_of(loop[1])
+            p.drawPolygon(QPolygonF([QPointF(x0, 0), QPointF(x0 + 7, 0), QPointF(x0, 7)]))
+            p.drawPolygon(QPolygonF([QPointF(x1, 0), QPointF(x1 - 7, 0), QPointF(x1, 7)]))
+            p.setPen(color)
+            p.drawLine(QPointF(x0, 0), QPointF(x0, h))
+            p.drawLine(QPointF(x1, 0), QPointF(x1, h))
+
         px_per_s = w / duration
         step = next((s for s in _TICK_STEPS if s * px_per_s >= _MIN_TICK_PX), _TICK_STEPS[-1])
-        text_color = pal.windowText().color()
-        p.setPen(text_color)
+        p.setPen(pal.windowText().color())
         font = p.font()
         font.setPointSizeF(font.pointSizeF() * 0.85)
         p.setFont(font)

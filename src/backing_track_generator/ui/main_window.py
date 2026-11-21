@@ -42,6 +42,7 @@ class MainWindow(QMainWindow):
         self.engine = engine if engine is not None else AudioEngine()
         self.timeline = Timeline(self)
         self.timeline.seekRequested.connect(self._on_seek)
+        self.timeline.loopChanged.connect(self._on_loop_changed)
         self._lanes: list[TrackLane] = []
         self._source_path: Path | None = None
         self._separated = False
@@ -74,6 +75,21 @@ class MainWindow(QMainWindow):
         self.act_stop.setShortcut(Qt.Key.Key_Home)
         self.act_stop.triggered.connect(self._on_stop)
 
+        self.act_loop = QAction("&Loop", self)
+        self.act_loop.setCheckable(True)
+        self.act_loop.setShortcut(Qt.Key.Key_L)
+        self.act_loop.setToolTip("Toggle looping (L). Drag on the ruler to set the loop region.")
+        self.act_loop.toggled.connect(self.timeline.set_loop_enabled)
+
+        self.act_loop_in = QAction("Set loop &start at playhead", self)
+        self.act_loop_in.setShortcut(Qt.Key.Key_BracketLeft)
+        self.act_loop_in.triggered.connect(self.set_loop_start_here)
+        self.act_loop_out = QAction("Set loop &end at playhead", self)
+        self.act_loop_out.setShortcut(Qt.Key.Key_BracketRight)
+        self.act_loop_out.triggered.connect(self.set_loop_end_here)
+        self.act_loop_clear = QAction("&Clear loop", self)
+        self.act_loop_clear.triggered.connect(self.timeline.clear_loop)
+
         self.act_separate = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload), "&Separate into stems", self)
         self.act_separate.setShortcut("Ctrl+E")
@@ -99,6 +115,11 @@ class MainWindow(QMainWindow):
         transport_menu = self.menuBar().addMenu("&Transport")
         transport_menu.addAction(self.act_play)
         transport_menu.addAction(self.act_stop)
+        transport_menu.addSeparator()
+        transport_menu.addAction(self.act_loop)
+        transport_menu.addAction(self.act_loop_in)
+        transport_menu.addAction(self.act_loop_out)
+        transport_menu.addAction(self.act_loop_clear)
 
     def _build_ui(self) -> None:
         tb = self.addToolBar("Transport")
@@ -108,10 +129,14 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.act_play)
         tb.addAction(self.act_stop)
+        tb.addAction(self.act_loop)
         tb.addSeparator()
         self.time_label = QLabel()
         self.time_label.setStyleSheet("font-family: monospace; font-size: 14pt; padding: 0 8px;")
         tb.addWidget(self.time_label)
+        self.loop_label = QLabel()
+        self.loop_label.setStyleSheet("font-family: monospace; padding: 0 8px;")
+        tb.addWidget(self.loop_label)
 
         central = QWidget()
         outer = QVBoxLayout(central)
@@ -183,12 +208,15 @@ class MainWindow(QMainWindow):
 
     def _set_tracks(self, tracks: list[Track], sample_rate: int, keep_transport: bool = False) -> None:
         position, playing = self.engine.position, self.engine.is_playing
+        loop, loop_on = self.timeline.loop, self.timeline.loop_enabled
         self.engine.load(tracks, sample_rate)
+        self._rebuild_lanes()  # resets the timeline, including the loop
         if keep_transport:
+            if loop is not None:
+                self.timeline.set_loop(*loop, enabled=loop_on)
             self.engine.seek(position)
             if playing:
                 self.engine.play()
-        self._rebuild_lanes()
         self._refresh()
 
     # ----- separation ----------------------------------------------------
@@ -277,6 +305,34 @@ class MainWindow(QMainWindow):
             lane.waveform.set_reference_peak(reference)
         self._update_time_label()
 
+    # ----- loop ----------------------------------------------------------
+
+    def _on_loop_changed(self) -> None:
+        tl = self.timeline
+        if tl.loop is not None:
+            self.engine.set_loop(*tl.loop, enabled=tl.loop_enabled)
+        else:
+            self.engine.set_loop_enabled(False)
+        self.act_loop.blockSignals(True)
+        self.act_loop.setChecked(tl.loop_enabled)
+        self.act_loop.blockSignals(False)
+        self._update_actions()
+        if tl.loop is None:
+            self.loop_label.setText("")
+        else:
+            state = "" if tl.loop_enabled else "  (off)"
+            self.loop_label.setText(f"Loop {format_time(tl.loop[0])} – {format_time(tl.loop[1])}{state}")
+
+    def set_loop_start_here(self) -> None:
+        tl, pos = self.timeline, self.engine.position
+        end = tl.loop[1] if tl.loop is not None and tl.loop[1] > pos else tl.duration
+        tl.set_loop(pos, end, enabled=True)
+
+    def set_loop_end_here(self) -> None:
+        tl, pos = self.timeline, self.engine.position
+        start = tl.loop[0] if tl.loop is not None and tl.loop[0] < pos else 0.0
+        tl.set_loop(start, pos, enabled=True)
+
     # ----- mute / solo ---------------------------------------------------
 
     def _on_mute(self, index: int, mute: bool) -> None:
@@ -337,6 +393,10 @@ class MainWindow(QMainWindow):
         loaded = self.engine.is_loaded
         self.act_play.setEnabled(loaded)
         self.act_stop.setEnabled(loaded)
+        self.act_loop.setEnabled(self.timeline.loop_valid)
+        self.act_loop_in.setEnabled(loaded)
+        self.act_loop_out.setEnabled(loaded)
+        self.act_loop_clear.setEnabled(self.timeline.loop is not None)
         self.act_separate.setEnabled(
             self._source_path is not None and self._job is None and not self._separated)
 
