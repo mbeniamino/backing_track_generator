@@ -490,3 +490,70 @@ def test_open_bad_project_shows_error(qapp, tmp_path, dialogs):
     assert not win.open_project(tmp_path)
     assert dialogs["asked"][0][0] == "critical"
     win.close()
+
+
+# ----- render ---------------------------------------------------------------------
+
+def test_render_audible_tracks_and_loop(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+
+    from backing_track_generator.audio_io import load_audio
+
+    win, _ = stems_window(tmp_path)  # vocals (440 Hz), bass (110 Hz)
+    vocals, bass = win.engine.tracks
+    win._lanes[0].mute_button.click()
+    assert win.act_render.isEnabled() and not win.act_render_loop.isEnabled()
+
+    # Name without extension + MP3 filter -> .mp3 appended.
+    seen = {}
+
+    def ask(parent, caption, default, filters):
+        seen["default"] = default
+        return str(tmp_path / "out"), "MP3 (*.mp3)"
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", ask)
+    win.act_render.trigger()
+    out = tmp_path / "out.mp3"
+    assert out.is_file() and seen["default"].endswith("song - backing.wav")
+    assert "bass" in win.statusBar().currentMessage() and "vocals" not in win.statusBar().currentMessage()
+
+    win.timeline.set_loop(0.5, 1.5, enabled=True)
+    assert win.act_render_loop.isEnabled()
+    path = win.render_to_file(loop_only=True, path=tmp_path / "loop.wav")
+    data, _ = load_audio(path)
+    np.testing.assert_allclose(data, bass.data[22050:66150], atol=1e-5)  # only bass, only the loop
+    win.close()
+
+
+@rubberband
+def test_render_uses_current_transposition_and_waits_for_it(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from backing_track_generator.audio_io import load_audio
+
+    infos = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a: infos.append(a[1]))
+    win, _ = stems_window(tmp_path)
+    win.transpose_spin.setValue(4)
+    assert win.render_to_file(path=tmp_path / "early.wav") is None  # still pending
+    assert infos == ["Transposition in progress"] and not (tmp_path / "early.wav").exists()
+
+    wait_until(qapp, lambda: win.semitones == 4)
+    path = win.render_to_file(path=tmp_path / "t.wav")
+    data, _ = load_audio(path)
+    expected = sum(t.data for t in win.engine.tracks)
+    np.testing.assert_allclose(data, expected, atol=1e-4)
+    win.close()
+
+
+def test_render_nothing_audible_shows_error(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    errors = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *a: errors.append(a[2]))
+    win, _ = stems_window(tmp_path)
+    for lane in win._lanes:
+        lane.mute_button.click()
+    assert win.render_to_file(path=tmp_path / "x.wav") is None
+    assert "no track is audible" in errors[0]
+    win.close()

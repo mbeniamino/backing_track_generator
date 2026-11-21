@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from ..audio_io import AudioLoadError, load_audio
 from ..engine import AudioEngine, Track
 from ..project import ProjectError, ProjectSettings, TrackSettings, is_project, load_project, save_project
+from ..render import FILE_FILTERS, FORMATS, RenderError, render_mix
 from ..separation import DEFAULT_MODEL, SeparationError, cache_dir_for, is_cached, load_stems
 from ..timefmt import format_time
 from ..transpose import MAX_SEMITONES, MIN_SEMITONES, TranspositionCache
@@ -74,6 +75,7 @@ class MainWindow(QMainWindow):
         self._project_saved_generation: int | None = None
         self._project_extra: dict = {}
         self._dirty = False
+        self._last_render_dir: Path | None = None
         self._separated = False
         self._job: SeparationJob | None = None
         # Transposition: originals + cached versions for the current track set.
@@ -159,6 +161,13 @@ class MainWindow(QMainWindow):
         self.act_save_as.setShortcut("Ctrl+Shift+S")
         self.act_save_as.triggered.connect(self.save_project_as)
 
+        self.act_render = QAction("&Render mix…", self)
+        self.act_render.setShortcut("Ctrl+Shift+E")
+        self.act_render.setToolTip("Render the audible tracks (with transposition) to one audio file")
+        self.act_render.triggered.connect(lambda: self.render_to_file(loop_only=False))
+        self.act_render_loop = QAction("Render &loop region…", self)
+        self.act_render_loop.triggered.connect(lambda: self.render_to_file(loop_only=True))
+
         self.act_quit = QAction("&Quit", self)
         self.act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         self.act_quit.triggered.connect(self.close)
@@ -169,6 +178,9 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.act_save)
         file_menu.addAction(self.act_save_as)
+        file_menu.addSeparator()
+        file_menu.addAction(self.act_render)
+        file_menu.addAction(self.act_render_loop)
         file_menu.addSeparator()
         file_menu.addAction(self.act_quit)
         tracks_menu = self.menuBar().addMenu("T&racks")
@@ -392,6 +404,59 @@ class MainWindow(QMainWindow):
         self._set_dirty(False)
         self.statusBar().showMessage(f"Saved project {directory}", 5000)
         return True
+
+    # ----- render ----------------------------------------------------------
+
+    def render_to_file(self, loop_only: bool = False, path: str | Path | None = None) -> Path | None:
+        """Render what is audible (mute/solo, current transposition) to one file.
+        Asks for the file name unless ``path`` is given."""
+        if not self.engine.is_loaded:
+            return None
+        if self._transpose_job is not None or self._semitones != self.transpose_spin.value():
+            QMessageBox.information(self, "Transposition in progress",
+                                    "Please wait until the transposition has finished, then render again.")
+            return None
+        loop = self.timeline.loop if loop_only else None
+        if loop_only and not self.timeline.loop_valid:
+            return None
+        if path is None:
+            path = self._ask_render_path(loop)
+            if path is None:
+                return None
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            result = render_mix(self.engine.tracks, self.engine.sample_rate, path,
+                                *(loop if loop is not None else (None, None)))
+        except (RenderError, OSError) as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Render failed", str(e))
+            return None
+        QApplication.restoreOverrideCursor()
+        self._last_render_dir = result.path.parent
+        msg = f"Rendered {format_time(result.seconds)} ({', '.join(result.tracks)}) to {result.path.name}"
+        if result.gain_db < 0:
+            msg += f"; level lowered {-result.gain_db:.1f} dB to avoid clipping"
+        self.statusBar().showMessage(msg, 10000)
+        return result.path
+
+    def _ask_render_path(self, loop: tuple[float, float] | None) -> Path | None:
+        stem = Path(self._source_name).stem or (self._project_dir.name if self._project_dir else "mix")
+        name = f"{stem} - backing"
+        if self._semitones:
+            name += f" {self._semitones:+d}st"
+        if loop is not None:
+            name += f" {format_time(loop[0], False).replace(':', '.')}-{format_time(loop[1], False).replace(':', '.')}"
+        directory = self._last_render_dir or (self._source_path.parent if self._source_path else Path.home())
+        path, selected = QFileDialog.getSaveFileName(
+            self, "Render loop region" if loop else "Render mix", str(directory / f"{name}.wav"), FILE_FILTERS)
+        if not path:
+            return None
+        path = Path(path)
+        if path.suffix.lower() not in FORMATS:
+            # Take the extension from the chosen filter, e.g. "MP3 (*.mp3)".
+            ext = selected[selected.find("*") + 1: selected.find(")")] if "*" in selected else ".wav"
+            path = path.with_name(path.name + ext)
+        return path
 
     def _on_open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -720,8 +785,9 @@ class MainWindow(QMainWindow):
         self.act_separate.setEnabled(
             self._source_path is not None and self._job is None and not self._separated)
         for w in (self.transpose_spin, self.act_transpose_up, self.act_transpose_down, self.act_transpose_reset,
-                  self.act_save, self.act_save_as):
+                  self.act_save, self.act_save_as, self.act_render):
             w.setEnabled(loaded)
+        self.act_render_loop.setEnabled(loaded and self.timeline.loop_valid)
 
     @property
     def semitones(self) -> int:

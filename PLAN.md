@@ -54,7 +54,7 @@ app/
 4. ✅ Loop: drag on ruler (edges adjustable), L toggles, [ ] set at playhead; 10 ms equal-power crossfade at wrap and on seek-while-playing.
 5. ✅ Transpose ±12 st: Rubber Band R3 (formant-preserving for vocals), parallel per stem, debounced, LRU cache of 2 versions, crossfaded hot-swap.
 6. ✅ Projects: folder with project.json + tracks/*.flac (original pitch); Save/Save As/Open, dirty tracking + prompt, settings-only re-save, atomic writes.
-7. Render current mix to a single file.
+7. ✅ Render: audible tracks at current transposition (whole song or loop) to WAV/FLAC/MP3/Ogg; scaled instead of clipped.
 8. (Future) Tempo/beat tracking (`beat_this` / `madmom`) → metronome track, count-in intro.
 
 ## Risks
