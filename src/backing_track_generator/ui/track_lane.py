@@ -21,8 +21,20 @@ class WaveformView(TimelineWidget):
     def __init__(self, timeline: Timeline, data: np.ndarray, parent: QWidget | None = None):
         super().__init__(timeline, parent)
         self._peaks = compute_peaks(data)
+        self._reference_peak = self.peak  # amplitude drawn at full lane height
         self._cache: QPixmap | None = None
         self.setMinimumHeight(60)
+
+    @property
+    def peak(self) -> float:
+        return float(np.abs(self._peaks).max(initial=0.0))
+
+    def set_reference_peak(self, peak: float) -> None:
+        """Use a common vertical scale across lanes so that track loudness
+        compares visually (a near-silent stem must not look full-scale)."""
+        self._reference_peak = peak
+        self._cache = None
+        self.update()
 
     def resizeEvent(self, event):
         self._cache = None
@@ -38,8 +50,7 @@ class WaveformView(TimelineWidget):
         p.setPen(self.palette().mid().color())
         p.drawLine(0, int(mid), w, int(mid))
         cols = resample_peaks(self._peaks, w)
-        # Scale so the loudest track sample nearly fills the lane.
-        scale = (h / 2 - 1) / max(float(np.abs(self._peaks).max(initial=0.0)), 1e-6) * 0.95
+        scale = (h / 2 - 1) / max(self._reference_peak, 1e-6) * 0.95
         p.setPen(WAVE_COLOR)
         p.drawLines([
             QLineF(x + 0.5, mid - hi * scale, x + 0.5, mid - lo * scale)
