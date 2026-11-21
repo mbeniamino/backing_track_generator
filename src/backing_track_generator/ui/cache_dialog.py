@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -24,12 +25,14 @@ from .. import cache
 from ..cache import format_size
 from ..separation import DEFAULT_MODEL, cache_root
 from . import theme
+from .settings import CACHE_LIMIT_CHOICES, AppSettings
 
 _PATH_ROLE = Qt.ItemDataRole.UserRole
 
 
 class CacheDialog(QDialog):
-    def __init__(self, parent=None, current_dir: Path | None = None, separation_running: bool = False):
+    def __init__(self, parent=None, current_dir: Path | None = None, separation_running: bool = False,
+                 settings: AppSettings | None = None):
         """``current_dir``: stem folder of the song that is open (marked in the
         list). ``separation_running``: temporary folders may be in use, so they
         aren't offered for deletion."""
@@ -38,6 +41,7 @@ class CacheDialog(QDialog):
         self.resize(760, 520)
         self.current_dir = current_dir
         self.separation_running = separation_running
+        self.settings = settings or AppSettings()
         self.freed = 0
 
         dim = f"color: {theme.TEXT_DIM.name()};"
@@ -49,6 +53,25 @@ class CacheDialog(QDialog):
         explain.setWordWrap(True)
         explain.setStyleSheet(dim)
         self.summary = QLabel()
+
+        self.limit = QComboBox()
+        current = self.settings.cache_limit
+        choices = list(CACHE_LIMIT_CHOICES)
+        if current not in choices:  # a value set by hand in settings.ini
+            choices.append(current)
+            choices.sort(key=lambda v: -1 if v is None else v)
+        for value in choices:
+            self.limit.addItem("No limit" if value is None else format_size(value), value)
+        self.limit.setCurrentIndex(choices.index(current))
+        self.limit.currentIndexChanged.connect(self._on_limit_changed)
+        limit_hint = QLabel("When a new song is separated and the cache is over the limit, the songs "
+                            "not used for the longest time are removed (never the open song).")
+        limit_hint.setWordWrap(True)
+        limit_hint.setStyleSheet(dim)
+        limit_row = QHBoxLayout()
+        limit_row.addWidget(QLabel("Size limit:"))
+        limit_row.addWidget(self.limit)
+        limit_row.addWidget(limit_hint, 1)
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Song", "Model", "Size", "Last used"])
@@ -103,8 +126,10 @@ class CacheDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
-        for w in (title, explain, self.summary, self.tree):
+        for w in (title, explain, self.summary):
             layout.addWidget(w)
+        layout.addLayout(limit_row)
+        layout.addWidget(self.tree)
         layout.addLayout(row)
         layout.addWidget(model_title)
         layout.addLayout(model_row)
@@ -179,6 +204,30 @@ class CacheDialog(QDialog):
         size = sum(s.size for s in self.songs) + sum(cache.dir_size(p) for p in self.leftovers)
         if paths and self._confirm(f"Delete all cached separations ({format_size(size)})?"):
             self.freed += cache.delete_paths(paths)
+            self.refresh()
+
+    def _on_limit_changed(self, _index: int) -> None:
+        new = self.limit.currentData()
+        keep = {self.current_dir} if self.current_dir is not None else set()
+        remove = cache.plan_limit(new, keep)
+        if remove:
+            names = "\n".join(f"  • {s.source}  ({format_size(s.size)})" for s in remove[:12])
+            if len(remove) > 12:
+                names += f"\n  … and {len(remove) - 12} more"
+            size = format_size(sum(s.size for s in remove))
+            ok = QMessageBox.question(
+                self, "Cache size limit",
+                f"With a limit of {format_size(new)}, {len(remove)} song(s) not used recently "
+                f"({size}) will be removed now:\n\n{names}\n\nContinue?")
+            if ok != QMessageBox.StandardButton.Yes:
+                previous = self.settings.cache_limit
+                self.limit.blockSignals(True)
+                self.limit.setCurrentIndex(self.limit.findData(previous))
+                self.limit.blockSignals(False)
+                return
+        self.settings.cache_limit = new
+        if remove:
+            self.freed += cache.delete_paths([s.path for s in remove])
             self.refresh()
 
     def _on_remove_old_models(self) -> None:

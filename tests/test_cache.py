@@ -91,3 +91,27 @@ def test_format_size():
     assert cache.format_size(1536) == "1.5 KB"
     assert cache.format_size(250 * 1024 ** 2) == "250.0 MB"
     assert cache.format_size(3 * 1024 ** 3) == "3.0 GB"
+
+
+def test_limit_removes_least_recently_used_but_keeps_open(tmp_path):
+    dirs = {}
+    for i, name in enumerate(["old.mp3", "mid.mp3", "new.mp3", "open.mp3"]):
+        dirs[name] = cache_song(tmp_path, name, frames=20000)
+        t = time.time() - 1000 + i * 100
+        if name == "open.mp3":
+            t = time.time() - 5000  # the oldest of all, but it's open
+        os.utime(dirs[name] / "manifest.json", (t, t))
+    size = cache.list_cached_songs()[0].size
+
+    assert cache.plan_limit(None) == []
+    assert cache.plan_limit(10 * size) == []
+    plan = cache.plan_limit(int(2.5 * size), keep={dirs["open.mp3"]})
+    assert [s.source for s in plan] == ["old.mp3", "mid.mp3"]  # oldest first, open one skipped
+
+    removed = cache.enforce_limit(int(2.5 * size), keep={dirs["open.mp3"]})
+    assert [s.source for s in removed] == ["old.mp3", "mid.mp3"]
+    assert sorted(s.source for s in cache.list_cached_songs()) == ["new.mp3", "open.mp3"]
+
+    # Even a limit of 0 never removes the kept song.
+    cache.enforce_limit(0, keep={dirs["open.mp3"]})
+    assert [s.source for s in cache.list_cached_songs()] == ["open.mp3"]

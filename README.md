@@ -58,6 +58,10 @@ mix would clip, it is lowered as a whole instead (the status bar says by how muc
 - **Separated stems** are cached in `~/.cache/backing-track-generator/stems/`
   (about 100–150 MB per song), so reopening a song is instant. Tracks → Manage
   cache lists them (size, last used) and deletes the ones you no longer need.
+  The cache has a size limit (5 GB by default, changeable there, or "No limit"):
+  after each separation, the songs not used for the longest time are removed
+  until it fits; the open song is never removed.
+- **Settings** are stored in `~/.config/backing-track-generator/settings.ini`.
 - **The separation model** lives in the Hugging Face cache (`~/.cache/huggingface/`).
   Tracks → Check for separation model updates downloads a newer version on request;
   Manage cache removes the older versions.

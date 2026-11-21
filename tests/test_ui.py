@@ -20,6 +20,7 @@ def qapp():
 @pytest.fixture(autouse=True)
 def isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
 
 
 def make_song(tmp_path, seconds=2.0):
@@ -775,7 +776,7 @@ def test_manage_cache_action_reports_freed_space(qapp, tmp_path, monkeypatch):
     from backing_track_generator.ui import main_window
 
     class FakeDialog:
-        def __init__(self, parent, current_dir, separation_running):
+        def __init__(self, parent, current_dir, separation_running, settings):
             FakeDialog.args = (current_dir, separation_running)
             self.freed = 3 * 1024 ** 2
 
@@ -810,3 +811,73 @@ def test_cache_dialog_enter_never_deletes(qapp, tmp_path, monkeypatch):
     dlg.tree.topLevelItem(0).setSelected(True)
     QTest.keyClick(dlg, Qt.Key.Key_Return)
     assert d.exists() and not dlg.isVisible()  # Enter closed the dialog, deleted nothing
+
+
+def test_cache_limit_setting_in_dialog(qapp, tmp_path, monkeypatch):
+    import os
+    import time
+
+    from PySide6.QtWidgets import QMessageBox
+
+    from backing_track_generator import cache
+    from backing_track_generator.ui import cache_dialog
+    from backing_track_generator.ui.settings import DEFAULT_CACHE_LIMIT, AppSettings
+
+    monkeypatch.setattr(cache, "model_cache_info", lambda model: cache.ModelCacheInfo("r", None, 0, [], 0))
+    settings = AppSettings()
+    assert settings.cache_limit == DEFAULT_CACHE_LIMIT
+    dirs = []
+    for i, name in enumerate(["a.mp3", "b.mp3", "c.mp3"]):
+        src = tmp_path / name
+        src.write_bytes(name.encode())
+        d = cache_dir_for(src)
+        write_stems(d, [Stem("bass", np.zeros((5000, 2), np.float32))], 44100, source=name, model="m")
+        t = time.time() - 100 + i  # a oldest, c newest
+        os.utime(d / "manifest.json", (t, t))
+        dirs.append(d)
+    size = max(s.size for s in cache.list_cached_songs())
+    small = int(2.5 * size)  # fits two songs
+    monkeypatch.setattr(cache_dialog, "CACHE_LIMIT_CHOICES", [None, small, DEFAULT_CACHE_LIMIT])
+
+    answers, asked = [], []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: (asked.append(a[2]), answers.pop(0))[1])
+
+    dlg = cache_dialog.CacheDialog(settings=settings, current_dir=dirs[0])  # a.mp3 is open
+    assert dlg.limit.currentData() == DEFAULT_CACHE_LIMIT and dlg.limit.currentText() == "5.0 GB"
+
+    dlg.limit.setCurrentIndex(dlg.limit.findData(None))  # no limit: nothing to remove, no question
+    assert settings.cache_limit is None and asked == []
+
+    # Two songs fit: the least recently used one that isn't open (b.mp3) must go.
+    answers.append(QMessageBox.StandardButton.No)
+    dlg.limit.setCurrentIndex(dlg.limit.findData(small))
+    assert "b.mp3" in asked[-1] and "a.mp3" not in asked[-1]
+    assert settings.cache_limit is None and dlg.limit.currentData() is None  # reverted
+    assert all(d.exists() for d in dirs)
+
+    answers.append(QMessageBox.StandardButton.Yes)
+    dlg.limit.setCurrentIndex(dlg.limit.findData(small))
+    assert settings.cache_limit == small
+    assert dirs[0].exists() and not dirs[1].exists() and dirs[2].exists()
+    assert dlg.freed > 0 and dlg.tree.topLevelItemCount() == 2
+    assert AppSettings().cache_limit == small  # persisted
+    dlg.close()
+
+
+def test_limit_enforced_after_separation(qapp, tmp_path):
+    from backing_track_generator.ui.settings import AppSettings
+
+    win, path = stems_window(tmp_path)  # its stems are cached
+    other = tmp_path / "other.mp3"
+    other.write_bytes(b"other")
+    old_dir = cache_dir_for(other)
+    write_stems(old_dir, [Stem("bass", np.zeros((1000, 2), np.float32))], 44100, source="other.mp3", model="m")
+    import os
+    os.utime(old_dir / "manifest.json", (0, 0))  # least recently used
+
+    win.settings.cache_limit = 1  # bytes: everything but the open song must go
+    win._on_separation_finished(cache_dir_for(path))
+    assert not old_dir.exists() and cache_dir_for(path).exists()
+    assert "removed 1 song" in win.statusBar().currentMessage()
+    assert AppSettings().cache_limit == 1
+    win.close()

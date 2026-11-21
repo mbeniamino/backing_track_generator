@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from ..audio_io import AudioLoadError, load_audio
 from ..engine import AudioEngine, Track
+from .. import cache
 from ..cache import format_size
 from ..model_update import ModelUpdateInfo, check_for_update, download_latest
 from ..project import ProjectError, ProjectSettings, TrackSettings, is_project, load_project, save_project
@@ -31,6 +32,7 @@ from ..timefmt import format_time
 from ..transpose import MAX_SEMITONES, MIN_SEMITONES, TranspositionCache
 from .background import BackgroundCall
 from .cache_dialog import CacheDialog
+from .settings import AppSettings
 from .separation_job import SeparationJob
 from .timeline import TimeRuler, Timeline
 from . import theme
@@ -86,6 +88,7 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._last_render_dir: Path | None = None
         self._model_task: BackgroundCall | None = None
+        self.settings = AppSettings()
         self._separated = False
         self._job: SeparationJob | None = None
         # Transposition: originals + cached versions for the current track set.
@@ -502,7 +505,8 @@ class MainWindow(QMainWindow):
         current = None
         if self._separated and self._source_path is not None and self._source_path.is_file():
             current = cache_dir_for(self._source_path)
-        dialog = CacheDialog(self, current_dir=current, separation_running=self._job is not None)
+        dialog = CacheDialog(self, current_dir=current, separation_running=self._job is not None,
+                             settings=self.settings)
         dialog.exec()
         if dialog.freed:
             self.statusBar().showMessage(f"Freed {format_size(dialog.freed)} of cache", 8000)
@@ -747,6 +751,19 @@ class MainWindow(QMainWindow):
     def _on_separation_finished(self, stem_dir: Path) -> None:
         self._finish_job()
         self._load_stems(stem_dir)
+        self._enforce_cache_limit(keep=stem_dir)
+
+    def _enforce_cache_limit(self, keep: Path) -> None:
+        """The cache only grows when a song is separated: trim it then."""
+        try:
+            removed = cache.enforce_limit(self.settings.cache_limit, keep={keep})
+        except OSError as e:
+            self.statusBar().showMessage(f"Could not trim the cache: {e}", 8000)
+            return
+        if removed:
+            size = format_size(sum(s.size for s in removed))
+            self.statusBar().showMessage(
+                f"Cache limit: removed {len(removed)} song(s) not used recently ({size})", 10000)
 
     def _on_separation_failed(self, message: str) -> None:
         self._finish_job()

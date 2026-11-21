@@ -75,6 +75,36 @@ def delete_paths(paths: list[Path]) -> int:
     return freed
 
 
+# ----- size limit ---------------------------------------------------------------------
+
+def plan_limit(limit: int | None, keep: set[Path] | frozenset = frozenset(),
+               root: Path | None = None) -> list[CachedSong]:
+    """Songs to delete so the cached separations fit in ``limit`` bytes:
+    least recently used first, never anything in ``keep`` (e.g. the open
+    song). ``None`` means no limit."""
+    if limit is None:
+        return []
+    songs = list_cached_songs(root)  # most recent first
+    total = sum(s.size for s in songs)
+    remove = []
+    for song in reversed(songs):  # oldest first
+        if total <= limit:
+            break
+        if song.path in keep:
+            continue
+        remove.append(song)
+        total -= song.size
+    return remove
+
+
+def enforce_limit(limit: int | None, keep: set[Path] | frozenset = frozenset(),
+                  root: Path | None = None) -> list[CachedSong]:
+    """Delete the songs ``plan_limit`` selects; returns them."""
+    remove = plan_limit(limit, keep, root)
+    delete_paths([s.path for s in remove])
+    return remove
+
+
 # ----- the Demucs model in the Hugging Face cache ----------------------------------------
 
 @dataclass
