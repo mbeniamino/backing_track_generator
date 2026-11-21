@@ -1,0 +1,163 @@
+import numpy as np
+import pytest
+import soundfile as sf
+
+from backing_track_generator.audio_io import AudioLoadError, load_audio, to_stereo
+from backing_track_generator.engine import AudioEngine, Track, audible_tracks
+from backing_track_generator.peaks import compute_peaks, resample_peaks
+from backing_track_generator.timefmt import format_time
+
+SR = 1000
+
+
+def const_track(name, value, frames=100, **kw):
+    return Track(name, np.full((frames, 2), value, np.float32), **kw)
+
+
+def make_engine(*tracks):
+    eng = AudioEngine(use_device=False)
+    eng.load(list(tracks), SR)
+    return eng
+
+
+# ----- mute / solo ---------------------------------------------------------
+
+def test_audible_no_solo_excludes_muted():
+    a, b = const_track("a", 0.1), const_track("b", 0.2, mute=True)
+    assert audible_tracks([a, b]) == [a]
+
+
+def test_audible_solo_overrides_mute():
+    a = const_track("a", 0.1)
+    b = const_track("b", 0.2, mute=True, solo=True)
+    assert audible_tracks([a, b]) == [b]
+
+
+# ----- engine --------------------------------------------------------------
+
+def test_render_silent_when_paused():
+    eng = make_engine(const_track("a", 0.5))
+    out = np.ones((10, 2), np.float32)
+    eng.render_block(out)
+    assert not out.any()
+    assert eng.position == 0
+
+
+def test_render_mixes_and_advances():
+    eng = make_engine(const_track("a", 0.1), const_track("b", 0.2))
+    eng.play()
+    out = np.zeros((10, 2), np.float32)
+    eng.render_block(out)
+    np.testing.assert_allclose(out, 0.3, rtol=1e-6)
+    assert eng.position == pytest.approx(10 / SR)
+
+
+def test_render_respects_mute():
+    eng = make_engine(const_track("a", 0.1), const_track("b", 0.2, mute=True))
+    eng.play()
+    out = np.zeros((10, 2), np.float32)
+    eng.render_block(out)
+    np.testing.assert_allclose(out, 0.1, rtol=1e-6)
+
+
+def test_render_clips():
+    eng = make_engine(const_track("a", 0.8), const_track("b", 0.8))
+    eng.play()
+    out = np.zeros((4, 2), np.float32)
+    eng.render_block(out)
+    assert out.max() == 1.0
+
+
+def test_end_of_track_stops_and_zero_fills_tail():
+    eng = make_engine(const_track("a", 0.5, frames=15))
+    eng.play()
+    out = np.zeros((10, 2), np.float32)
+    eng.render_block(out)
+    eng.render_block(out)
+    assert not eng.is_playing
+    np.testing.assert_allclose(out[:5], 0.5)
+    assert not out[5:].any()
+    # Play at end restarts from the beginning.
+    eng.play()
+    assert eng.position == 0
+
+
+def test_seek_clamps_and_stop_rewinds():
+    eng = make_engine(const_track("a", 0.5, frames=100))
+    eng.seek(-1)
+    assert eng.position == 0
+    eng.seek(10)
+    assert eng.position == pytest.approx(eng.duration)
+    eng.seek(0.05)
+    eng.play()
+    eng.stop()
+    assert eng.position == 0 and not eng.is_playing
+
+
+def test_load_pads_shorter_tracks():
+    eng = make_engine(const_track("a", 0.1, frames=50), const_track("b", 0.1, frames=80))
+    assert all(t.data.shape[0] == 80 for t in eng.tracks)
+    assert eng.duration == pytest.approx(80 / SR)
+
+
+# ----- peaks ---------------------------------------------------------------
+
+def test_compute_peaks_min_max():
+    data = np.zeros((600, 2), np.float32)
+    data[10] = 0.5
+    data[300] = -0.7
+    peaks = compute_peaks(data, block=256)
+    assert peaks.shape == (3, 2)
+    assert peaks[0, 1] == pytest.approx(0.5)
+    assert peaks[1, 0] == pytest.approx(-0.7)
+
+
+@pytest.mark.parametrize("width", [1, 3, 10, 1000])
+def test_resample_peaks_width(width):
+    peaks = np.array([[-0.1, 0.1], [-0.9, 0.2], [-0.3, 0.8], [0, 0]], np.float32)
+    cols = resample_peaks(peaks, width)
+    assert cols.shape == (width, 2)
+    if width == 1:
+        np.testing.assert_allclose(cols[0], [-0.9, 0.8])
+
+
+# ----- audio io ------------------------------------------------------------
+
+def test_to_stereo_mono_duplicated():
+    out = to_stereo(np.arange(4, dtype=np.float64))
+    assert out.shape == (4, 2) and out.dtype == np.float32
+    np.testing.assert_array_equal(out[:, 0], out[:, 1])
+
+
+def test_load_wav(tmp_path):
+    path = tmp_path / "x.wav"
+    sf.write(path, np.linspace(-0.5, 0.5, 2000), 22050)
+    data, sr = load_audio(path)
+    assert sr == 22050 and data.shape == (2000, 2)
+
+
+def test_load_via_ffmpeg_fallback(tmp_path):
+    pytest.importorskip("shutil").which("ffmpeg") or pytest.skip("no ffmpeg")
+    import subprocess
+
+    path = tmp_path / "x.m4a"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=f=440:d=0.5", "-ac", "1", str(path)],
+        check=True,
+    )
+    data, sr = load_audio(path)
+    assert sr == 44100 and data.shape[1] == 2
+    assert abs(data.shape[0] - 22050) < 2048  # encoder padding
+
+
+def test_load_missing_file(tmp_path):
+    with pytest.raises(AudioLoadError):
+        load_audio(tmp_path / "nope.wav")
+
+
+# ----- formatting ----------------------------------------------------------
+
+def test_format_time():
+    assert format_time(0) == "0:00.0"
+    assert format_time(65.25) == "1:05.2"
+    assert format_time(600, tenths=False) == "10:00"

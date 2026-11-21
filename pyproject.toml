@@ -1,0 +1,26 @@
+[project]
+name = "backing-track-generator"
+version = "0.1.0"
+description = "Generate, customize and play backing tracks from a single audio file"
+authors = [
+    { name = "Matteo Beniamino", email = "beniamino@tautologica.org" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.5",
+    "pyside6>=6.12.0",
+    "sounddevice>=0.5.6",
+    "soundfile>=0.14.0",
+]
+
+[project.scripts]
+backing-track-generator = "backing_track_generator:main"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]

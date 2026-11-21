@@ -1,0 +1,22 @@
+This GUI app will allow to generate, customize and play backing tracks starting
+from a single audio file.
+
+These are the features to implement:
+- via a free LLM model the input audio is separated into several tracks, ideally
+  one for each instrument or voice;
+- the tracks will be shown (via their waveforms) from top to bottom, the x-axis
+  is the time and is shared between the tracks;
+- each track will have a Mute and a Solo button, to set if it plays or not;
+- the user can play and listen to only the tracks they set for playing;
+- the user can jump to any point in the song with a mouse click;
+- the user can set a loop for playing setting two loop points in the timeline;
+- the user can choose to transpose the tracks by an integer number of semitones
+  (negative values included);
+- the user can save the single tracks and the current settings as a project;
+- the user can render the current audible tracks to a single audio file;
+
+Future features:
+- an extra track will be put at the top with a generated metronome beat (this
+  implies the autodetection of the tempo throughout the song);
+- the user can add an intro count before the beginning of the song (this also
+  implies the autodetection of the BPMs at the start);
