@@ -96,3 +96,63 @@ def test_real_separation_in_subprocess(tmp_path):
     assert len(stems) == 6 and sr == SR
     mix = sum(s.data for s in stems)
     assert np.sqrt(((mix[:, 0] - 0.3 * np.sin(2 * np.pi * 110 * t)) ** 2).mean()) < 0.02
+
+
+# ----- model loading without network ------------------------------------------------
+
+_LOAD_SCRIPT = r'''
+import socket, sys, json
+attempts = []
+def guard(*a, **k):
+    attempts.append(str(a[1] if len(a) > 1 else a))
+    raise OSError("network disabled by test")
+socket.socket.connect = guard
+socket.create_connection = guard
+
+mode = sys.argv[1]
+import demucs.pretrained
+if mode == "missing":
+    demucs.pretrained.get_model = lambda name: "downloaded:" + name  # stub the real download
+from backing_track_generator.separation import load_model
+from huggingface_hub import constants
+downloads = []
+model = load_model("htdemucs_6s", on_download=lambda: downloads.append(1))
+print(json.dumps({"model": type(model).__name__ if mode == "cached" else model,
+                  "downloads": len(downloads), "attempts": attempts,
+                  "offline_restored": constants.HF_HUB_OFFLINE is False}))
+'''
+
+
+def _run_load(tmp_path, mode, env_extra):
+    import json
+    import subprocess
+    import sys
+
+    script = tmp_path / "load.py"
+    script.write_text(_LOAD_SCRIPT)
+    env = {**os.environ, **env_extra}
+    env.pop("HF_HUB_OFFLINE", None)
+    proc = subprocess.run([sys.executable, "-I", str(script), mode], capture_output=True, text=True,
+                          env=env, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1]), proc.stderr
+
+
+def _hf_cached() -> bool:
+    from pathlib import Path
+
+    base = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+    return (base / "models--adefossez--HTDemucs-6s").is_dir()
+
+
+@pytest.mark.skipif(not _hf_cached(), reason="Demucs model not downloaded yet")
+def test_cached_model_loads_without_any_network(tmp_path):
+    out, stderr = _run_load(tmp_path, "cached", {})
+    assert out == {"model": "BagOfModels", "downloads": 0, "attempts": [], "offline_restored": True}
+    assert "unauthenticated" not in stderr
+
+
+def test_missing_model_falls_back_to_download(tmp_path):
+    out, _ = _run_load(tmp_path, "missing", {"HF_HOME": str(tmp_path / "hf")})
+    # Offline attempt made no connection; then the (stubbed) download path ran.
+    assert out == {"model": "downloaded:htdemucs_6s", "downloads": 1, "attempts": [], "offline_restored": True}

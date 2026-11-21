@@ -131,15 +131,11 @@ def separate(
     report(None, "Loading audio…")
     mix, sr = load_audio(input_path)
 
-    report(None, "Loading model (downloaded on first use)…")
+    report(None, "Loading model…")
     import torch
     from demucs.apply import apply_model
-    from demucs.pretrained import get_model
 
-    try:
-        model = get_model(model_name)
-    except Exception as e:  # network errors, unknown model, ...
-        raise SeparationError(f"Could not load model {model_name!r}: {e}") from e
+    model = load_model(model_name, on_download=lambda: report(None, "Downloading model (first use only)…"))
     model.eval()
 
     wav = torch.from_numpy(mix.T.copy())  # (2, frames)
@@ -180,6 +176,39 @@ def separate(
              for i, name in enumerate(model.sources)]
     write_stems(stem_dir, stems, sr, source=Path(input_path).name, model=model_name)
     return stem_dir
+
+
+# ----- model loading ---------------------------------------------------------
+
+def load_model(model_name: str, on_download: Callable[[], None] | None = None):
+    """Load a Demucs model, from the local Hugging Face cache when possible.
+
+    The first attempt runs in Hugging Face offline mode: no network request at
+    all (Demucs would otherwise contact the Hub on every load just to check for
+    updates, and the Hub answers anonymous requests with a warning). Only when
+    the model isn't cached yet is it downloaded, via Demucs' normal loader.
+    """
+    from demucs.hf import get_hf_model
+    from demucs.pretrained import get_model
+    from huggingface_hub import constants as hf_constants
+    from huggingface_hub.utils import logging as hf_logging
+
+    hf_logging.set_verbosity_error()  # no "unauthenticated requests" warning on download
+    previous = hf_constants.HF_HUB_OFFLINE
+    hf_constants.HF_HUB_OFFLINE = True  # read at request time by huggingface_hub
+    try:
+        return get_hf_model(model_name)
+    except Exception:  # not cached (LocalEntryNotFoundError), or a broken cache
+        pass
+    finally:
+        hf_constants.HF_HUB_OFFLINE = previous
+
+    if on_download:
+        on_download()
+    try:
+        return get_model(model_name)
+    except Exception as e:  # network errors, unknown model, ...
+        raise SeparationError(f"Could not load model {model_name!r}: {e}") from e
 
 
 # ----- worker process --------------------------------------------------------
