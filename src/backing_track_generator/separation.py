@@ -10,16 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
-import soundfile as sf
 
-from .audio_io import load_audio
+from .audio_io import load_audio, load_audio_scaled, write_flac
+from .fsutil import staged_dir
 
 DEFAULT_MODEL = "htdemucs_6s"  # vocals, drums, bass, guitar, piano, other
 MANIFEST = "manifest.json"
@@ -66,20 +64,12 @@ def is_cached(stem_dir: Path) -> bool:
 
 
 def write_stems(stem_dir: Path, stems: list[Stem], sample_rate: int, source: str, model: str) -> None:
-    """Write stems as 24-bit FLAC plus a manifest, atomically (temp dir + rename).
-
-    FLAC is integer-based, so a stem that peaks above 1.0 is scaled down and the
-    inverse gain is stored in the manifest to restore it exactly on load.
-    """
-    stem_dir.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(prefix=".tmp-", dir=stem_dir.parent))
-    try:
+    """Write stems as 24-bit FLAC plus a manifest, atomically."""
+    with staged_dir(stem_dir) as tmp:
         entries = []
         for stem in stems:
-            peak = float(np.abs(stem.data).max(initial=0.0))
-            gain = peak / 0.999 if peak > 0.999 else 1.0
             fname = f"{stem.name}.flac"
-            sf.write(tmp / fname, stem.data / gain, sample_rate, subtype="PCM_24")
+            gain = write_flac(tmp / fname, stem.data, sample_rate)
             entries.append({"name": stem.name, "file": fname, "gain": gain})
         manifest = {
             "version": MANIFEST_VERSION,
@@ -89,12 +79,6 @@ def write_stems(stem_dir: Path, stems: list[Stem], sample_rate: int, source: str
             "stems": entries,
         }
         (tmp / MANIFEST).write_text(json.dumps(manifest, indent=2))
-        if stem_dir.exists():
-            shutil.rmtree(stem_dir)
-        tmp.rename(stem_dir)
-    except BaseException:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise
 
 
 def load_stems(stem_dir: Path) -> tuple[list[Stem], int]:
@@ -103,11 +87,9 @@ def load_stems(stem_dir: Path) -> tuple[list[Stem], int]:
     stems = []
     sr = manifest["sample_rate"]
     for entry in manifest["stems"]:
-        data, file_sr = load_audio(stem_dir / entry["file"])
+        data, file_sr = load_audio_scaled(stem_dir / entry["file"], entry.get("gain", 1.0))
         if file_sr != sr:
             raise SeparationError(f"Sample rate mismatch in {entry['file']}")
-        if entry.get("gain", 1.0) != 1.0:
-            data *= np.float32(entry["gain"])
         stems.append(Stem(entry["name"], data))
     return sort_stems(stems), sr
 

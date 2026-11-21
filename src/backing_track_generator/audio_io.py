@@ -60,3 +60,23 @@ def _decode_with_ffmpeg(path: Path) -> tuple[np.ndarray, int]:
         raise AudioLoadError(f"Could not decode {path.name}: {msg}")
     data = np.frombuffer(proc.stdout, dtype=np.float32).reshape(-1, 2)
     return data, FFMPEG_SAMPLE_RATE
+
+
+FLAC_HEADROOM = 0.999
+
+
+def write_flac(path: str | Path, data: np.ndarray, sample_rate: int) -> float:
+    """Write 24-bit FLAC. FLAC is integer-based, so audio peaking above full
+    scale is scaled down; the returned gain restores it (pass it to
+    ``load_audio_scaled``). Returns 1.0 when no scaling was needed."""
+    peak = float(np.abs(data).max(initial=0.0))
+    gain = peak / FLAC_HEADROOM if peak > FLAC_HEADROOM else 1.0
+    sf.write(path, data / gain if gain != 1.0 else data, sample_rate, subtype="PCM_24")
+    return gain
+
+
+def load_audio_scaled(path: str | Path, gain: float = 1.0) -> tuple[np.ndarray, int]:
+    data, sr = load_audio(path)
+    if gain != 1.0:
+        data = data * np.float32(gain)  # not in place: ffmpeg-decoded arrays are read-only
+    return data, sr

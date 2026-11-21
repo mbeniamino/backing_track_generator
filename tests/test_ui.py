@@ -346,3 +346,147 @@ def test_transpose_failure_reverts_value(qapp, tmp_path, monkeypatch):
     assert "nope" in warnings[0]
     assert win.transpose_spin.value() == 0 and win.semitones == 0
     win.close()
+
+
+# ----- projects ------------------------------------------------------------------
+
+@pytest.fixture
+def dialogs(monkeypatch):
+    """Scripted answers for file dialogs and question boxes."""
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+    answers = {"save_path": None, "question": QMessageBox.StandardButton.Discard, "asked": []}
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(answers["save_path"]), ""))
+
+    def question(parent, title, text, *a, **k):
+        answers["asked"].append(title)
+        return answers["question"]
+
+    monkeypatch.setattr(QMessageBox, "question", question)
+    monkeypatch.setattr(QMessageBox, "critical", lambda *a: answers["asked"].append(("critical", a[2])))
+    return answers
+
+
+@rubberband
+def test_project_save_and_reopen(qapp, tmp_path, dialogs):
+    win, path = stems_window(tmp_path)
+    originals = [t.data.copy() for t in win.engine.tracks]
+    win._lanes[0].mute_button.click()
+    win._lanes[1].solo_button.click()
+    win.timeline.set_loop(0.5, 1.5, enabled=False)
+    win.engine.seek(1.25)
+    win.transpose_spin.setValue(2)
+    wait_until(qapp, lambda: win.semitones == 2)
+
+    dialogs["save_path"] = tmp_path / "My Project"
+    assert win.act_save.isEnabled()
+    win.act_save.trigger()  # no project yet -> Save As
+    proj = tmp_path / "My Project"
+    assert (proj / "project.json").is_file() and len(list((proj / "tracks").glob("*.flac"))) == 2
+    assert win.windowTitle().startswith("My Project —")
+    win.close()
+
+    win2 = make_window()
+    assert win2.open_project(proj)
+    tracks = win2.engine.tracks
+    assert [(t.name, t.mute, t.solo) for t in tracks] == [("vocals", True, False), ("bass", False, True)]
+    assert win2.timeline.loop == (pytest.approx(0.5), pytest.approx(1.5)) and not win2.timeline.loop_enabled
+    assert win2.engine.position == pytest.approx(1.25, abs=0.01)
+    assert win2._separated and win2._source_path == path
+    assert win2.transpose_spin.value() == 2
+    # Saved at original pitch, transposed again on load.
+    for (_, d), o in zip(win2._transpose_cache.originals, originals):
+        np.testing.assert_allclose(d, o, atol=1e-5)
+    wait_until(qapp, lambda: win2.semitones == 2)
+    assert not win2._dirty and "*" not in win2.windowTitle()
+    win2.close()
+    assert dialogs["asked"] == []  # nothing unsaved -> no prompts
+
+
+def test_settings_change_marks_dirty_and_resaves_json_only(qapp, tmp_path, dialogs):
+    win, _ = stems_window(tmp_path)
+    dialogs["save_path"] = tmp_path / "p"
+    assert win.save_project_as()
+    tracks_dir = tmp_path / "p" / "tracks"
+    mtimes = {f.name: f.stat().st_mtime_ns for f in tracks_dir.iterdir()}
+
+    win._lanes[1].mute_button.click()
+    assert win._dirty and "p* —" in win.windowTitle()
+    win.act_save.trigger()
+    assert not win._dirty and "*" not in win.windowTitle()
+    assert {f.name: f.stat().st_mtime_ns for f in tracks_dir.iterdir()} == mtimes
+    import json
+
+    doc = json.loads((tmp_path / "p" / "project.json").read_text())
+    assert [t["mute"] for t in doc["tracks"]] == [False, True]
+    win.close()
+
+
+def test_close_with_unsaved_changes_prompts(qapp, tmp_path, dialogs):
+    from PySide6.QtWidgets import QMessageBox
+
+    win, _ = stems_window(tmp_path)
+    dialogs["save_path"] = tmp_path / "p"
+    win.save_project_as()
+    win._lanes[0].solo_button.click()
+
+    dialogs["question"] = QMessageBox.StandardButton.Cancel
+    win.close()
+    assert win.isVisible() and dialogs["asked"] == ["Unsaved changes"]
+
+    dialogs["question"] = QMessageBox.StandardButton.Save
+    win.close()
+    assert not win.isVisible() and not win._dirty
+    import json
+
+    assert json.loads((tmp_path / "p" / "project.json").read_text())["tracks"][0]["solo"] is True
+
+
+def test_unseparated_project_gets_stems_on_next_save(qapp, tmp_path, dialogs):
+    path = make_song(tmp_path, 2.0)
+    win = make_window()
+    win.open_file(path, separate=False)
+    dialogs["save_path"] = tmp_path / "p"
+    win.save_project_as()
+    assert [f.name for f in (tmp_path / "p" / "tracks").iterdir()] == ["song.flac"]
+
+    write_stems(cache_dir_for(path), [Stem("bass", np.full((88200, 2), 0.1, np.float32)),
+                                      Stem("drums", np.full((88200, 2), 0.2, np.float32))],
+                44100, source=path.name, model="htdemucs_6s")
+    win.start_separation()
+    assert win._dirty
+    win.save_project()
+    assert sorted(f.name for f in (tmp_path / "p" / "tracks").iterdir()) == ["bass.flac", "drums.flac"]
+    win.close()
+
+    win2 = make_window()
+    win2.open_path(tmp_path / "p")  # folder works too
+    assert [t.name for t in win2.engine.tracks] == ["bass", "drums"] and win2._separated
+    assert not win2.act_separate.isEnabled()
+    win2.close()
+
+
+def test_unseparated_project_with_moved_source_separates_saved_track(qapp, tmp_path, dialogs):
+    sub = tmp_path / "music"
+    sub.mkdir()
+    path = make_song(sub, 1.0)
+    win = make_window()
+    win.open_file(path, separate=False)
+    dialogs["save_path"] = tmp_path / "p"
+    win.save_project_as()
+    win.close()
+    path.unlink()
+
+    win2 = make_window()
+    win2.open_project(tmp_path / "p" / "project.json")
+    assert win2._source_path == tmp_path / "p" / "tracks" / "song.flac"
+    assert win2.act_separate.isEnabled()
+    win2.close()
+
+
+def test_open_bad_project_shows_error(qapp, tmp_path, dialogs):
+    (tmp_path / "project.json").write_text("{}")
+    win = make_window()
+    assert not win.open_project(tmp_path)
+    assert dialogs["asked"][0][0] == "critical"
+    win.close()

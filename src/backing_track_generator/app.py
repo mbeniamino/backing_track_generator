@@ -16,5 +16,5 @@ def main() -> None:
     window.show()
     args = app.arguments()[1:]
     if args:
-        window.open_file(args[0])
+        window.open_path(args[0])
     sys.exit(app.exec())

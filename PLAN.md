@@ -53,7 +53,7 @@ app/
 3. ✅ Multi-track lanes on a shared timeline + Mute/Solo (Ctrl+click = exclusive solo, 10 ms click-free gain ramps, inaudible lanes greyed).
 4. ✅ Loop: drag on ruler (edges adjustable), L toggles, [ ] set at playhead; 10 ms equal-power crossfade at wrap and on seek-while-playing.
 5. ✅ Transpose ±12 st: Rubber Band R3 (formant-preserving for vocals), parallel per stem, debounced, LRU cache of 2 versions, crossfaded hot-swap.
-6. Project save/load.
+6. ✅ Projects: folder with project.json + tracks/*.flac (original pitch); Save/Save As/Open, dirty tracking + prompt, settings-only re-save, atomic writes.
 7. Render current mix to a single file.
 8. (Future) Tempo/beat tracking (`beat_this` / `madmom`) → metronome track, count-in intro.
 

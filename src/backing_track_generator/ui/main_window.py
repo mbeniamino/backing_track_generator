@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
 
 from ..audio_io import AudioLoadError, load_audio
 from ..engine import AudioEngine, Track
-from ..separation import SeparationError, cache_dir_for, is_cached, load_stems
+from ..project import ProjectError, ProjectSettings, TrackSettings, is_project, load_project, save_project
+from ..separation import DEFAULT_MODEL, SeparationError, cache_dir_for, is_cached, load_stems
 from ..timefmt import format_time
 from ..transpose import MAX_SEMITONES, MIN_SEMITONES, TranspositionCache
 from .separation_job import SeparationJob
@@ -67,6 +68,12 @@ class MainWindow(QMainWindow):
         self.timeline.loopChanged.connect(self._on_loop_changed)
         self._lanes: list[TrackLane] = []
         self._source_path: Path | None = None
+        self._source_name = ""
+        # Project: where it's saved, which track set its files hold, unsaved changes.
+        self._project_dir: Path | None = None
+        self._project_saved_generation: int | None = None
+        self._project_extra: dict = {}
+        self._dirty = False
         self._separated = False
         self._job: SeparationJob | None = None
         # Transposition: originals + cached versions for the current track set.
@@ -142,12 +149,26 @@ class MainWindow(QMainWindow):
         self.act_reset_ms.setEnabled(False)
         self.act_reset_ms.triggered.connect(self.reset_mute_solo)
 
+        self.act_open_project = QAction("Open &project…", self)
+        self.act_open_project.setShortcut("Ctrl+Shift+O")
+        self.act_open_project.triggered.connect(self._on_open_project)
+        self.act_save = QAction(style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "&Save project", self)
+        self.act_save.setShortcut(QKeySequence.StandardKey.Save)
+        self.act_save.triggered.connect(self.save_project)
+        self.act_save_as = QAction("Save project &as…", self)
+        self.act_save_as.setShortcut("Ctrl+Shift+S")
+        self.act_save_as.triggered.connect(self.save_project_as)
+
         self.act_quit = QAction("&Quit", self)
         self.act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         self.act_quit.triggered.connect(self.close)
 
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self.act_open)
+        file_menu.addAction(self.act_open_project)
+        file_menu.addSeparator()
+        file_menu.addAction(self.act_save)
+        file_menu.addAction(self.act_save_as)
         file_menu.addSeparator()
         file_menu.addAction(self.act_quit)
         tracks_menu = self.menuBar().addMenu("T&racks")
@@ -170,6 +191,7 @@ class MainWindow(QMainWindow):
         tb = self.addToolBar("Transport")
         tb.setMovable(False)
         tb.addAction(self.act_open)
+        tb.addAction(self.act_save)
         tb.addAction(self.act_separate)
         tb.addSeparator()
         tb.addAction(self.act_play)
@@ -244,6 +266,8 @@ class MainWindow(QMainWindow):
         """Load ``path`` as a single track, then (by default) split it into
         stems: instantly if they are cached, otherwise in the background."""
         path = Path(path)
+        if not self._confirm_discard():
+            return
         self.cancel_separation()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -257,8 +281,12 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
         self._source_path = path
+        self._source_name = path.name
         self._separated = False
-        self.setWindowTitle(f"{path.name} — Backing Track Generator")
+        self._project_dir = None
+        self._project_saved_generation = None
+        self._project_extra = {}
+        self._set_dirty(False)
         self.statusBar().showMessage(f"Loaded {path.name} ({sr} Hz, {format_time(self.engine.duration)})", 5000)
         if separate:
             self.start_separation()
@@ -278,7 +306,138 @@ class MainWindow(QMainWindow):
             if playing:
                 self.engine.play()
         self._reset_transposition(keep_value=keep_transport)
+        self._set_dirty(True)
         self._refresh()
+
+    # ----- projects --------------------------------------------------------
+
+    def _set_dirty(self, dirty: bool) -> None:
+        self._dirty = dirty
+        if self._project_dir is not None:
+            name = self._project_dir.name
+        else:
+            name = self._source_name
+        star = "*" if dirty and self._project_dir is not None else ""
+        self.setWindowTitle(f"{name}{star} — Backing Track Generator" if name else "Backing Track Generator")
+
+    def _confirm_discard(self) -> bool:
+        """Before replacing the session: offer to save an open project with
+        unsaved changes. Returns False if the user cancels."""
+        if self._project_dir is None or not self._dirty:
+            return True
+        answer = QMessageBox.question(
+            self, "Unsaved changes", f"Save changes to the project \"{self._project_dir.name}\"?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save)
+        if answer == QMessageBox.StandardButton.Save:
+            return self.save_project()
+        return answer == QMessageBox.StandardButton.Discard
+
+    def _project_settings(self) -> ProjectSettings:
+        tl = self.timeline
+        return ProjectSettings(
+            sample_rate=self.engine.sample_rate,
+            tracks=[TrackSettings(t.name, t.mute, t.solo, t.gain) for t in self.engine.tracks],
+            source_name=self._source_name,
+            source_path=str(self._source_path) if self._source_path is not None else None,
+            separated=self._separated,
+            model=DEFAULT_MODEL if self._separated else None,
+            transpose=self.transpose_spin.value(),
+            loop=tl.loop,
+            loop_enabled=tl.loop is not None and tl.loop_enabled,
+            position=self.engine.position,
+            extra=self._project_extra,
+        )
+
+    def save_project(self) -> bool:
+        if not self.engine.is_loaded:
+            return False
+        if self._project_dir is None:
+            return self.save_project_as()
+        same_tracks = self._project_saved_generation == self._track_generation
+        return self._write_project(self._project_dir, tracks=not same_tracks)
+
+    def save_project_as(self) -> bool:
+        if not self.engine.is_loaded:
+            return False
+        start = self._project_dir or (
+            self._source_path.with_suffix("") if self._source_path is not None else Path.home())
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save project as (a folder will be created)", str(start), "Project folder (*)",
+            options=QFileDialog.Option.DontConfirmOverwrite)
+        if not path:
+            return False
+        target = Path(path)
+        if target.name == "project.json":
+            target = target.parent
+        if target != self._project_dir and is_project(target):
+            answer = QMessageBox.question(self, "Replace project?",
+                                          f"\"{target.name}\" is already a project. Replace it?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        return self._write_project(target, tracks=True)
+
+    def _write_project(self, directory: Path, tracks: bool) -> bool:
+        datas = [d for _, d in self._transpose_cache.originals] if tracks else None
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            save_project(directory, self._project_settings(), datas)
+        except (ProjectError, OSError) as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Cannot save project", str(e))
+            return False
+        QApplication.restoreOverrideCursor()
+        self._project_dir = directory
+        self._project_saved_generation = self._track_generation
+        self._set_dirty(False)
+        self.statusBar().showMessage(f"Saved project {directory}", 5000)
+        return True
+
+    def _on_open_project(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open project", str(self._project_dir or Path.home()), "Backing track project (project.json)")
+        if path:
+            self.open_project(path)
+
+    def open_project(self, path: str | Path) -> bool:
+        if not self._confirm_discard():
+            return False
+        self.cancel_separation()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            settings, datas, directory = load_project(path)
+        except ProjectError as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Cannot open project", str(e))
+            return False
+        try:
+            tracks = [Track(ts.name, d, mute=ts.mute, solo=ts.solo, gain=ts.gain)
+                      for ts, d in zip(settings.tracks, datas)]
+            self._set_tracks(tracks, settings.sample_rate)
+            if settings.loop is not None:
+                self.timeline.set_loop(*settings.loop, enabled=settings.loop_enabled)
+            self.engine.seek(settings.position)
+            self.transpose_spin.setValue(settings.transpose)
+            self._apply_transpose()  # no need to wait for the debounce
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._separated = settings.separated
+        self._source_name = settings.source_name or directory.name
+        source = Path(settings.source_path) if settings.source_path else None
+        if source is None or not source.is_file():
+            # Not separated and the original moved: separate the saved track instead.
+            saved = sorted((directory / "tracks").glob("*.flac"))
+            source = saved[0] if saved and not settings.separated else None
+        self._source_path = source
+        self._project_dir = directory
+        self._project_saved_generation = self._track_generation
+        self._project_extra = settings.extra
+        self._set_dirty(False)
+        self._update_actions()
+        self._refresh()
+        self.statusBar().showMessage(f"Opened project {directory}", 5000)
+        return True
 
     # ----- transposition -------------------------------------------------
 
@@ -296,6 +455,7 @@ class MainWindow(QMainWindow):
         self._apply_transpose()
 
     def _on_transpose_value_changed(self, _value: int) -> None:
+        self._set_dirty(True)
         self._transpose_timer.start()  # (re)start the debounce
 
     def _apply_transpose(self) -> None:
@@ -457,6 +617,7 @@ class MainWindow(QMainWindow):
     # ----- loop ----------------------------------------------------------
 
     def _on_loop_changed(self) -> None:
+        self._set_dirty(True)
         tl = self.timeline
         if tl.loop is not None:
             self.engine.set_loop(*tl.loop, enabled=tl.loop_enabled)
@@ -486,14 +647,17 @@ class MainWindow(QMainWindow):
 
     def _on_mute(self, index: int, mute: bool) -> None:
         self.engine.set_mute(index, mute)
+        self._set_dirty(True)
         self._sync_lanes()
 
     def _on_solo(self, index: int, solo: bool, exclusive: bool) -> None:
         self.engine.set_solo(index, solo, exclusive)
+        self._set_dirty(True)
         self._sync_lanes()
 
     def reset_mute_solo(self) -> None:
         self.engine.reset_mute_solo()
+        self._set_dirty(True)
         self._sync_lanes()
 
     def _sync_lanes(self) -> None:
@@ -512,7 +676,14 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event):
         urls = [u for u in event.mimeData().urls() if u.isLocalFile()]
         if urls:
-            self.open_file(urls[0].toLocalFile())
+            self.open_path(urls[0].toLocalFile())
+
+    def open_path(self, path: str | Path) -> None:
+        """Open a project (folder or project.json) or an audio file."""
+        if is_project(path):
+            self.open_project(path)
+        else:
+            self.open_file(path)
 
     # ----- transport -----------------------------------------------------
 
@@ -548,7 +719,8 @@ class MainWindow(QMainWindow):
         self.act_loop_clear.setEnabled(self.timeline.loop is not None)
         self.act_separate.setEnabled(
             self._source_path is not None and self._job is None and not self._separated)
-        for w in (self.transpose_spin, self.act_transpose_up, self.act_transpose_down, self.act_transpose_reset):
+        for w in (self.transpose_spin, self.act_transpose_up, self.act_transpose_down, self.act_transpose_reset,
+                  self.act_save, self.act_save_as):
             w.setEnabled(loaded)
 
     @property
@@ -557,6 +729,9 @@ class MainWindow(QMainWindow):
         return self._semitones
 
     def closeEvent(self, event):
+        if not self._confirm_discard():
+            event.ignore()
+            return
         self.cancel_separation()
         job = self._transpose_job
         self._cancel_transpose_job()
