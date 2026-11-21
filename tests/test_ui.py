@@ -557,3 +557,109 @@ def test_render_nothing_audible_shows_error(qapp, tmp_path, monkeypatch):
     assert win.render_to_file(path=tmp_path / "x.wav") is None
     assert "no track is audible" in errors[0]
     win.close()
+
+
+def test_defining_loop_moves_playhead_into_it(qapp, tmp_path):
+    win = loaded_window(tmp_path)
+    w = win.ruler.width()
+    win.engine.seek(1.0)
+    drag(win.ruler, w * 0.4, w * 0.6)  # loop 4-6 s, playhead at 1 s
+    assert win.engine.position == pytest.approx(4.0, abs=0.05)
+
+    win.engine.seek(8.0)
+    drag(win.ruler, w * 0.6, w * 0.7)  # move end edge: playhead still outside
+    assert win.engine.position == pytest.approx(4.0, abs=0.05)
+
+    win.act_loop.trigger()  # off
+    win.engine.seek(9.0)
+    assert win.engine.position == pytest.approx(9.0)
+    win.act_loop.trigger()  # on again -> into the loop
+    assert win.engine.position == pytest.approx(4.0, abs=0.05)
+
+    win.engine.seek(5.0)  # inside: edits keep the playhead where it is
+    drag(win.ruler, w * 0.4, w * 0.3)
+    assert win.engine.position == pytest.approx(5.0)
+    win.close()
+
+
+def test_loop_drag_does_not_jump_until_release(qapp, tmp_path):
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    win = loaded_window(tmp_path)
+    w, y = win.ruler.width(), win.ruler.height() / 2
+    win.engine.seek(1.0)
+
+    def send(kind, x, buttons):
+        QApplication.sendEvent(win.ruler, QMouseEvent(kind, QPointF(x, y), win.ruler.mapToGlobal(QPointF(x, y)),
+                                                      Qt.MouseButton.LeftButton, buttons, Qt.KeyboardModifier.NoModifier))
+
+    send(QMouseEvent.Type.MouseButtonPress, w * 0.4, Qt.MouseButton.LeftButton)
+    send(QMouseEvent.Type.MouseMove, w * 0.6, Qt.MouseButton.LeftButton)
+    assert win.engine.position == pytest.approx(1.0)  # mid-drag: not yet
+    send(QMouseEvent.Type.MouseButtonRelease, w * 0.6, Qt.MouseButton.NoButton)
+    assert win.engine.position == pytest.approx(4.0, abs=0.05)
+    win.close()
+
+
+# ----- volume ---------------------------------------------------------------------
+
+def test_volume_slider(qapp, tmp_path, dialogs):
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    from backing_track_generator.audio_io import load_audio
+    from backing_track_generator.ui.track_lane import GAIN_MIN_DB, db_to_gain, gain_to_db
+
+    win, _ = stems_window(tmp_path)
+    lane = win._lanes[1]  # bass
+    lane.volume.setValue(-6)
+    assert win.engine.tracks[1].gain == pytest.approx(10 ** (-6 / 20))
+    assert lane.gain_label.text() == "-6 dB" and lane.waveform._gain == pytest.approx(0.501, abs=1e-3)
+
+    lane.volume.setValue(GAIN_MIN_DB)  # bottom of the range = silent
+    assert win.engine.tracks[1].gain == 0.0 and lane.gain_label.text() == "−∞ dB"
+    QTest.mouseDClick(lane.volume, Qt.MouseButton.LeftButton, pos=QPoint(5, lane.volume.height() // 2))
+    assert lane.volume.value() == 0 and win.engine.tracks[1].gain == 1.0
+
+    # Saved in the project, restored on the slider.
+    lane.volume.setValue(-12)
+    dialogs["save_path"] = tmp_path / "p"
+    win.save_project_as()
+    path = win.render_to_file(path=tmp_path / "mix.wav")
+    data, _ = load_audio(path)
+    expected = win.engine.tracks[0].data + win.engine.tracks[1].data * np.float32(db_to_gain(-12))
+    np.testing.assert_allclose(data, expected, atol=1e-4)
+    win.close()
+
+    win2 = make_window()
+    win2.open_project(tmp_path / "p")
+    assert win2._lanes[1].volume.value() == -12 and win2._lanes[1].gain_label.text() == "-12 dB"
+    assert win2.engine.tracks[1].gain == pytest.approx(db_to_gain(-12))
+    win2.close()
+
+    assert gain_to_db(0.0) == GAIN_MIN_DB and gain_to_db(1.0) == 0 and gain_to_db(100.0) == 6
+
+
+def test_volume_change_marks_project_dirty(qapp, tmp_path, dialogs):
+    win, _ = stems_window(tmp_path)
+    dialogs["save_path"] = tmp_path / "p"
+    win.save_project_as()
+    win._lanes[0].volume.setValue(-3)
+    assert win._dirty
+    win._dirty = False
+    win.close()
+
+
+def test_theme_applies(qapp):
+    from backing_track_generator.ui import theme
+
+    theme.apply_theme(qapp)
+    for kind in ("play", "pause", "stop", "loop", "open", "save", "split"):
+        assert not theme.icon(kind).isNull()
+    assert theme.track_color("vocals", 0) != theme.track_color("bass", 1)
+    assert theme.track_color("zither", 0) != theme.track_color("kazoo", 1)
+    win = make_window()
+    win.grab()
+    win.close()

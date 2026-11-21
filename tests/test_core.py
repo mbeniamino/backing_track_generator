@@ -256,15 +256,55 @@ def test_loop_audio_after_crossfade_is_from_loop_start():
     np.testing.assert_allclose(out[310:400, 0], np.arange(210, 300) / 1000, atol=1e-6)
 
 
-def test_play_from_before_loop_enters_it_and_past_it_plays_out():
+def test_play_outside_loop_starts_at_loop_start():
     eng = make_engine(ramp_track(1000))
     eng.set_loop(0.3, 0.6)
-    eng.play()  # from 0: reaches 0.6 then wraps
-    render(eng, 700)
-    assert 0.3 <= eng.position < 0.6
-    eng.seek(0.8)  # past the loop end: no wrap
+    for outside in (0.0, 0.6, 0.9):
+        eng.pause()
+        eng.seek(outside)
+        eng.play()
+        assert eng.position == pytest.approx(0.3)
+    eng.pause()
+    eng.seek(0.45)  # inside: unchanged
+    eng.play()
+    assert eng.position == pytest.approx(0.45)
+
+
+def test_seek_past_loop_while_playing_plays_out():
+    eng = make_engine(ramp_track(1000))
+    eng.set_loop(0.3, 0.6)
+    eng.seek(0.3)
+    eng.play()
+    eng.seek(0.8)  # explicit seek outside the loop is honoured
     render(eng, 300)
     assert not eng.is_playing and eng.position == pytest.approx(1.0)
+
+
+def test_jump_into_loop():
+    eng = make_engine(ramp_track(1000))
+    eng.seek(0.1)
+    eng.jump_into_loop()  # no loop: nothing happens
+    assert eng.position == pytest.approx(0.1)
+    eng.set_loop(0.3, 0.6)
+    eng.jump_into_loop()
+    assert eng.position == pytest.approx(0.3)
+    eng.seek(0.5)
+    eng.jump_into_loop()  # already inside
+    assert eng.position == pytest.approx(0.5)
+    eng.set_loop_enabled(False)
+    eng.seek(0.9)
+    eng.jump_into_loop()  # loop off
+    assert eng.position == pytest.approx(0.9)
+
+
+def test_set_gain_scales_output():
+    eng = make_engine(const_track("a", 0.4, frames=1000))
+    eng.play()
+    render(eng, 10)
+    eng.set_gain(0, 0.5)
+    out = render(eng, 100)
+    assert out[-1, 0] == pytest.approx(0.2)  # after the 10 ms ramp
+    assert np.all(np.diff(out[:, 0]) <= 1e-7)  # ramped down, no jump up
 
 
 def test_loop_disabled_or_too_short_does_not_wrap():

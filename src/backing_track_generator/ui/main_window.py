@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QSpinBox,
-    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -30,7 +29,8 @@ from ..timefmt import format_time
 from ..transpose import MAX_SEMITONES, MIN_SEMITONES, TranspositionCache
 from .separation_job import SeparationJob
 from .timeline import TimeRuler, Timeline
-from .track_lane import HEADER_WIDTH, TrackLane
+from . import theme
+from .track_lane import HEADER_OFFSET, TrackLane
 from .transpose_job import TransposeJob
 
 AUDIO_FILTER = "Audio files (*.wav *.flac *.mp3 *.ogg *.m4a *.aac *.opus *.aiff *.aif);;All files (*)"
@@ -47,6 +47,10 @@ class SemitoneSpinBox(QSpinBox):
         self.setRange(MIN_SEMITONES, MAX_SEMITONES)
         self.setSuffix(" st")
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Its own arrows are hidden by the theme (zero width): − / + buttons sit beside
+        # it instead. (NoButtons would be simpler, but with a stylesheet it leaves the
+        # text field 1 px wide.)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setToolTip("Transpose all tracks by semitones (+ / − keys, 0 to reset)")
 
     def textFromValue(self, value: int) -> str:
@@ -67,6 +71,7 @@ class MainWindow(QMainWindow):
         self.timeline = Timeline(self)
         self.timeline.seekRequested.connect(self._on_seek)
         self.timeline.loopChanged.connect(self._on_loop_changed)
+        self.timeline.loopCommitted.connect(self._on_loop_committed)
         self._lanes: list[TrackLane] = []
         self._source_path: Path | None = None
         self._source_name = ""
@@ -99,23 +104,22 @@ class MainWindow(QMainWindow):
     # ----- construction --------------------------------------------------
 
     def _build_actions(self) -> None:
-        style = self.style()
-        self.act_open = QAction(style.standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton), "&Open audio…", self)
+        self.act_open = QAction(theme.icon("open"), "&Open audio…", self)
         self.act_open.setShortcut(QKeySequence.StandardKey.Open)
         self.act_open.triggered.connect(self._on_open)
 
-        self._icon_play = style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
-        self._icon_pause = style.standardIcon(QStyle.StandardPixmap.SP_MediaPause)
+        self._icon_play = theme.icon("play", theme.ACCENT.lighter(130))
+        self._icon_pause = theme.icon("pause", theme.ACCENT.lighter(130))
         self.act_play = QAction(self._icon_play, "Play", self)
         self.act_play.setShortcut(Qt.Key.Key_Space)
         self.act_play.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self.act_play.triggered.connect(self._on_play_pause)
 
-        self.act_stop = QAction(style.standardIcon(QStyle.StandardPixmap.SP_MediaStop), "Stop", self)
+        self.act_stop = QAction(theme.icon("stop"), "Stop", self)
         self.act_stop.setShortcut(Qt.Key.Key_Home)
         self.act_stop.triggered.connect(self._on_stop)
 
-        self.act_loop = QAction("&Loop", self)
+        self.act_loop = QAction(theme.icon("loop", theme.LOOP), "&Loop", self)
         self.act_loop.setCheckable(True)
         self.act_loop.setShortcut(Qt.Key.Key_L)
         self.act_loop.setToolTip("Toggle looping (L). Drag on the ruler to set the loop region.")
@@ -141,7 +145,7 @@ class MainWindow(QMainWindow):
         self.act_transpose_reset.triggered.connect(lambda: self.transpose_spin.setValue(0))
 
         self.act_separate = QAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload), "&Separate into stems", self)
+            theme.icon("split"), "&Separate into stems", self)
         self.act_separate.setShortcut("Ctrl+E")
         self.act_separate.setToolTip("Split the song into instrument/voice tracks with Demucs")
         self.act_separate.triggered.connect(self.start_separation)
@@ -154,7 +158,7 @@ class MainWindow(QMainWindow):
         self.act_open_project = QAction("Open &project…", self)
         self.act_open_project.setShortcut("Ctrl+Shift+O")
         self.act_open_project.triggered.connect(self._on_open_project)
-        self.act_save = QAction(style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "&Save project", self)
+        self.act_save = QAction(theme.icon("save"), "&Save project", self)
         self.act_save.setShortcut(QKeySequence.StandardKey.Save)
         self.act_save.triggered.connect(self.save_project)
         self.act_save_as = QAction("Save project &as…", self)
@@ -202,6 +206,7 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         tb = self.addToolBar("Transport")
         tb.setMovable(False)
+        tb.setIconSize(QSize(22, 22))
         tb.addAction(self.act_open)
         tb.addAction(self.act_save)
         tb.addAction(self.act_separate)
@@ -210,37 +215,54 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_stop)
         tb.addAction(self.act_loop)
         tb.addSeparator()
-        tb.addWidget(QLabel(" Transpose "))
+        self.time_label = QLabel()
+        self.time_label.setObjectName("timeDisplay")
+        self.time_label.setTextFormat(Qt.TextFormat.RichText)
+        tb.addWidget(self.time_label)
+        tb.addSeparator()
+        caption = QLabel("TRANSPOSE")
+        caption.setObjectName("toolbarCaption")
+        tb.addWidget(caption)
         self.transpose_spin = SemitoneSpinBox()
         self.transpose_spin.valueChanged.connect(self._on_transpose_value_changed)
-        tb.addWidget(self.transpose_spin)
+        self._step_buttons = []
+        for action, text in ((self.act_transpose_down, "−"), (self.act_transpose_up, "+")):
+            if text == "+":
+                tb.addWidget(self.transpose_spin)
+            button = QToolButton()
+            button.setText(text)
+            button.setToolTip(action.text().replace("&", ""))
+            button.setObjectName("stepButton")
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.clicked.connect(action.trigger)
+            tb.addWidget(button)
+            self._step_buttons.append(button)
         tb.addSeparator()
-        self.time_label = QLabel()
-        self.time_label.setStyleSheet("font-family: monospace; font-size: 14pt; padding: 0 8px;")
-        tb.addWidget(self.time_label)
         self.loop_label = QLabel()
-        self.loop_label.setStyleSheet("font-family: monospace; padding: 0 8px;")
+        self.loop_label.setObjectName("loopDisplay")
         tb.addWidget(self.loop_label)
 
         central = QWidget()
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(4)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(6)
 
         ruler_row = QHBoxLayout()
         ruler_row.setContentsMargins(0, 0, 0, 0)
         ruler_row.setSpacing(0)
-        ruler_row.addSpacing(HEADER_WIDTH)
+        ruler_row.addSpacing(HEADER_OFFSET)
         self.ruler = TimeRuler(self.timeline)
+        self.ruler.hide()  # shown once something is loaded
         ruler_row.addWidget(self.ruler, 1)
         outer.addLayout(ruler_row)
 
         self.lanes_layout = QVBoxLayout()
         self.lanes_layout.setContentsMargins(0, 0, 0, 0)
-        self.lanes_layout.setSpacing(4)
+        self.lanes_layout.setSpacing(6)
         outer.addLayout(self.lanes_layout, 1)
 
-        self.placeholder = QLabel("Open an audio file (Ctrl+O) or drop one here.")
+        self.placeholder = QLabel("Drop a song here\n\nor press Ctrl+O to open one")
+        self.placeholder.setObjectName("placeholder")
         self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lanes_layout.addWidget(self.placeholder)
 
@@ -665,10 +687,12 @@ class MainWindow(QMainWindow):
             lane.deleteLater()
         self._lanes.clear()
         self.placeholder.hide()
+        self.ruler.show()
         self.timeline.set_duration(self.engine.duration)
         self.timeline.set_position(0.0)
         for i, track in enumerate(self.engine.tracks):
-            lane = TrackLane(self.timeline, track.name, track.data)
+            lane = TrackLane(self.timeline, track.name, track.data, theme.track_color(track.name, i))
+            lane.gainChanged.connect(lambda gain, i=i: self._on_gain(i, gain))
             lane.muteToggled.connect(lambda mute, i=i: self._on_mute(i, mute))
             lane.soloToggled.connect(lambda solo, exclusive, i=i: self._on_solo(i, solo, exclusive))
             self.lanes_layout.addWidget(lane, 1)
@@ -698,6 +722,11 @@ class MainWindow(QMainWindow):
             state = "" if tl.loop_enabled else "  (off)"
             self.loop_label.setText(f"Loop {format_time(tl.loop[0])} – {format_time(tl.loop[1])}{state}")
 
+    def _on_loop_committed(self) -> None:
+        """A loop was just defined or switched on: bring the playhead into it."""
+        self.engine.jump_into_loop()
+        self._refresh()
+
     def set_loop_start_here(self) -> None:
         tl, pos = self.timeline, self.engine.position
         end = tl.loop[1] if tl.loop is not None and tl.loop[1] > pos else tl.duration
@@ -720,6 +749,10 @@ class MainWindow(QMainWindow):
         self._set_dirty(True)
         self._sync_lanes()
 
+    def _on_gain(self, index: int, gain: float) -> None:
+        self.engine.set_gain(index, gain)
+        self._set_dirty(True)
+
     def reset_mute_solo(self) -> None:
         self.engine.reset_mute_solo()
         self._set_dirty(True)
@@ -729,7 +762,7 @@ class MainWindow(QMainWindow):
         """Make every lane's buttons and greying match the engine."""
         audible = self.engine.audible_indices()
         for i, (lane, track) in enumerate(zip(self._lanes, self.engine.tracks)):
-            lane.set_state(track.mute, track.solo, i in audible)
+            lane.set_state(track.mute, track.solo, i in audible, track.gain)
         self.act_reset_ms.setEnabled(any(t.mute or t.solo for t in self.engine.tracks))
 
     # ----- drag & drop ---------------------------------------------------
@@ -772,7 +805,10 @@ class MainWindow(QMainWindow):
         self._update_time_label()
 
     def _update_time_label(self) -> None:
-        self.time_label.setText(f"{format_time(self.engine.position)} / {format_time(self.engine.duration)}")
+        self.time_label.setText(
+            f"{format_time(self.engine.position)}"
+            f"<span style='color:{theme.TEXT_DIM.name()}; font-size:11pt; font-weight:400'>"
+            f" / {format_time(self.engine.duration)}</span>")
 
     def _update_actions(self) -> None:
         loaded = self.engine.is_loaded
@@ -785,7 +821,7 @@ class MainWindow(QMainWindow):
         self.act_separate.setEnabled(
             self._source_path is not None and self._job is None and not self._separated)
         for w in (self.transpose_spin, self.act_transpose_up, self.act_transpose_down, self.act_transpose_reset,
-                  self.act_save, self.act_save_as, self.act_render):
+                  self.act_save, self.act_save_as, self.act_render, *self._step_buttons):
             w.setEnabled(loaded)
         self.act_render_loop.setEnabled(loaded and self.timeline.loop_valid)
 

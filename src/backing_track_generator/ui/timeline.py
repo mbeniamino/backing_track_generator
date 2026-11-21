@@ -5,16 +5,17 @@ from __future__ import annotations
 from enum import Enum, auto
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPolygonF
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from ..engine import MIN_LOOP_SECONDS
 from ..timefmt import format_time
+from . import theme
 
-PLAYHEAD_COLOR = QColor("#ff5252")
-LOOP_COLOR = QColor("#ff9800")
-LOOP_FILL_ENABLED = QColor(255, 152, 0, 45)
-LOOP_FILL_DISABLED = QColor(128, 128, 128, 35)
+PLAYHEAD_COLOR = theme.PLAYHEAD
+LOOP_COLOR = theme.LOOP
+LOOP_FILL_ENABLED = QColor(LOOP_COLOR.red(), LOOP_COLOR.green(), LOOP_COLOR.blue(), 24)
+LOOP_FILL_DISABLED = QColor(140, 145, 160, 28)
 
 # Candidate tick spacings in seconds; the smallest one giving enough room is used.
 _TICK_STEPS = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600]
@@ -33,7 +34,8 @@ class Timeline(QObject):
     durationChanged = Signal(float)
     positionChanged = Signal(float)
     seekRequested = Signal(float)
-    loopChanged = Signal()
+    loopChanged = Signal()  # any change, including every step of a drag
+    loopCommitted = Signal()  # an edit is complete (drag released, key, toggle)
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -76,17 +78,21 @@ class Timeline(QObject):
     def loop_valid(self) -> bool:
         return self._loop is not None and self._loop[1] - self._loop[0] >= MIN_LOOP_SECONDS
 
-    def set_loop(self, start: float, end: float, enabled: bool | None = None) -> None:
+    def set_loop(self, start: float, end: float, enabled: bool | None = None, commit: bool = True) -> None:
+        """``commit=False`` while the user is still dragging."""
         a, b = sorted((start, end))
         self._loop = (min(max(a, 0.0), self._duration), min(max(b, 0.0), self._duration))
         if enabled is not None:
             self._loop_enabled = enabled
         self.loopChanged.emit()
+        if commit:
+            self.loopCommitted.emit()
 
     def set_loop_enabled(self, enabled: bool) -> None:
         if enabled != self._loop_enabled:
             self._loop_enabled = enabled
             self.loopChanged.emit()
+            self.loopCommitted.emit()
 
     def clear_loop(self) -> None:
         self._loop = None
@@ -146,9 +152,8 @@ class TimelineWidget(QWidget):
         p.fillRect(QRectF(x0, 0, x1 - x0, self.height()), LOOP_FILL_ENABLED if enabled else LOOP_FILL_DISABLED)
         if edges:
             color = QColor(LOOP_COLOR)
-            if not enabled:
-                color.setAlpha(90)
-            p.setPen(color)
+            color.setAlpha(200 if enabled else 80)
+            p.setPen(QPen(color, 1.5, Qt.PenStyle.DashLine if not enabled else Qt.PenStyle.SolidLine))
             for x in (x0, x1):
                 p.drawLine(QPointF(x, 0), QPointF(x, self.height()))
 
@@ -167,7 +172,7 @@ class TimeRuler(TimelineWidget):
 
     def __init__(self, timeline: Timeline, parent: QWidget | None = None):
         super().__init__(timeline, parent)
-        self.setFixedHeight(24)
+        self.setFixedHeight(28)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setToolTip("Click to jump · drag to set a loop · drag loop edges to adjust")
@@ -202,7 +207,7 @@ class TimeRuler(TimelineWidget):
         if self._drag is _Drag.PENDING and abs(x - self._anchor_x) >= _DRAG_THRESHOLD_PX:
             self._drag = _Drag.NEW
         if self._drag is _Drag.NEW:
-            tl.set_loop(tl.x_to_time(self._anchor_x, self.width()), t, enabled=True)
+            tl.set_loop(tl.x_to_time(self._anchor_x, self.width()), t, enabled=True, commit=False)
         elif self._drag in (_Drag.START, _Drag.END):
             start, end = tl.loop
             if self._drag is _Drag.START:
@@ -211,7 +216,7 @@ class TimeRuler(TimelineWidget):
                 end = t
             if start > end:  # dragged one edge past the other: swap roles
                 self._drag = _Drag.END if self._drag is _Drag.START else _Drag.START
-            tl.set_loop(start, end)
+            tl.set_loop(start, end, commit=False)
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
@@ -222,49 +227,63 @@ class TimeRuler(TimelineWidget):
         elif drag is _Drag.NEW and not self.timeline.loop_valid:
             self.timeline.clear_loop()  # too short to be a loop: treat as a click
             self._seek_to(event.position().x())
+        elif drag in (_Drag.NEW, _Drag.START, _Drag.END):
+            self.timeline.loopCommitted.emit()
 
     def paintEvent(self, event):  # noqa: ARG002
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pal = self.palette()
-        p.fillRect(self.rect(), pal.window().color().darker(110))
         w, h = self.width(), self.height()
+        bg = QPainterPath()
+        bg.addRoundedRect(QRectF(0, 0, w, h), 6, 6)
+        p.fillPath(bg, theme.PANEL)
         duration = self.timeline.duration
         if duration <= 0:
             return
+        p.setClipPath(bg)
 
         self.paint_loop(p, edges=False)
         loop = self.timeline.loop
         if loop is not None:
-            # Edge handles: small flags at the top of the ruler.
+            # Edge handles: flags hanging from the top of the ruler.
             color = QColor(LOOP_COLOR)
             if not self.timeline.loop_enabled:
                 color.setAlpha(110)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(color)
             x0, x1 = self.x_of(loop[0]), self.x_of(loop[1])
-            p.drawPolygon(QPolygonF([QPointF(x0, 0), QPointF(x0 + 7, 0), QPointF(x0, 7)]))
-            p.drawPolygon(QPolygonF([QPointF(x1, 0), QPointF(x1 - 7, 0), QPointF(x1, 7)]))
-            p.setPen(color)
+            p.drawPolygon(QPolygonF([QPointF(x0, 0), QPointF(x0 + 8, 0), QPointF(x0, 9)]))
+            p.drawPolygon(QPolygonF([QPointF(x1, 0), QPointF(x1 - 8, 0), QPointF(x1, 9)]))
+            p.setPen(QPen(color, 1.5))
             p.drawLine(QPointF(x0, 0), QPointF(x0, h))
             p.drawLine(QPointF(x1, 0), QPointF(x1, h))
 
         px_per_s = w / duration
         step = next((s for s in _TICK_STEPS if s * px_per_s >= _MIN_TICK_PX), _TICK_STEPS[-1])
-        p.setPen(pal.windowText().color())
         font = p.font()
-        font.setPointSizeF(font.pointSizeF() * 0.85)
+        font.setPointSizeF(font.pointSizeF() * 0.8)
         p.setFont(font)
+        minor = QColor(theme.TEXT_DIM)
+        minor.setAlpha(90)
+        p.setPen(QPen(minor, 1))
+        for i in range(int(duration / (step / 4)) + 1):  # minor ticks
+            x = i * step / 4 * px_per_s
+            p.drawLine(QPointF(x, h - 4), QPointF(x, h))
         i = 0
         while (t := i * step) <= duration:
             x = t * px_per_s
-            p.drawLine(QPointF(x, h - 8), QPointF(x, h))
-            p.drawText(QRectF(x + 3, 0, 100, h - 4), Qt.AlignmentFlag.AlignVCenter, format_time(t, step < 1))
+            p.setPen(QPen(theme.TEXT_DIM, 1))
+            p.drawLine(QPointF(x, h - 9), QPointF(x, h))
+            p.drawText(QRectF(x + 4, 0, 100, h - 5), Qt.AlignmentFlag.AlignVCenter, format_time(t, step < 1))
             i += 1
 
         x = self.playhead_x()
+        glow = QColor(PLAYHEAD_COLOR)
+        glow.setAlpha(60)
         p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(glow)
+        p.drawPolygon(QPolygonF([QPointF(x - 9, 0), QPointF(x + 9, 0), QPointF(x, 14)]))
         p.setBrush(PLAYHEAD_COLOR)
         p.drawPolygon(QPolygonF([QPointF(x - 6, 0), QPointF(x + 6, 0), QPointF(x, 10)]))
-        p.setPen(PLAYHEAD_COLOR)
+        p.setPen(QPen(PLAYHEAD_COLOR, 1.5))
         p.drawLine(QPointF(x, 0), QPointF(x, h))

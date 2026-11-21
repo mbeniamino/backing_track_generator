@@ -122,6 +122,11 @@ class AudioEngine:
                     t.solo = False
             self._tracks[index].solo = solo
 
+    def set_gain(self, index: int, gain: float) -> None:
+        """Track volume (linear); changes are ramped like mute/solo."""
+        with self._lock:
+            self._tracks[index].gain = max(float(gain), 0.0)
+
     def reset_mute_solo(self) -> None:
         with self._lock:
             for t in self._tracks:
@@ -144,10 +149,14 @@ class AudioEngine:
         return self._pos / self._sample_rate
 
     def play(self) -> None:
+        """Start playing. With an active loop, playback starts inside it: from
+        the loop start if the playhead is outside the loop."""
         with self._lock:
             if self._length == 0:
                 return
-            if self._pos >= self._length:
+            if self._loop_active() and not self._in_loop(self._pos):
+                self._pos = self._loop_start
+            elif self._pos >= self._length:
                 self._pos = 0
             self._playing = True
 
@@ -194,6 +203,18 @@ class AudioEngine:
     @property
     def loop_active(self) -> bool:
         return self._loop_active()
+
+    def jump_into_loop(self) -> None:
+        """If looping and the playhead is outside the loop, move it to the loop
+        start (crossfaded while playing)."""
+        with self._lock:
+            if self._loop_active() and not self._in_loop(self._pos):
+                if self._playing:
+                    self._begin_crossfade(self._pos)
+                self._pos = self._loop_start
+
+    def _in_loop(self, frame: int) -> bool:
+        return self._loop_start <= frame < self._loop_end
 
     def _loop_active(self) -> bool:
         return (self._loop_enabled
