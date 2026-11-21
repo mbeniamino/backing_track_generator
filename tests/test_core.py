@@ -324,3 +324,45 @@ def test_seek_while_playing_is_crossfaded():
     eng.seek(0.6123)
     b = render(eng, 1000)[:, 0]
     assert max_step(np.concatenate([a, b])) < 1.5 * natural
+
+
+# ----- swap_audio (transposition) --------------------------------------------------
+
+def test_swap_audio_keeps_transport_and_crossfades():
+    eng = sine_engine()
+    eng.set_loop(0.2, 0.8)
+    eng.set_mute(0, False)
+    eng.seek(0.3)
+    eng.play()
+    a = render(eng, 800)[:, 0]
+    natural = max_step(a)
+    pos = eng.position
+    # Swap in a different-phase signal: a hard switch would jump.
+    t = np.arange(8000) / 8000
+    other = np.repeat((0.5 * np.cos(2 * np.pi * 100 * t + 1.0)).astype(np.float32)[:, None], 2, axis=1)
+    eng.swap_audio([other])
+    assert eng.position == pos and eng.is_playing and eng.loop_active
+    b = render(eng, 800)[:, 0]
+    assert max_step(np.concatenate([a, b])) < 1.5 * natural
+    np.testing.assert_allclose(b[200:], other[int(pos * 8000) + 200: int(pos * 8000) + 800, 0], atol=1e-6)
+    assert eng.tracks[0].tail_data is None  # old audio released after the crossfade
+
+
+def test_swap_audio_fits_length_and_checks_count():
+    eng = make_engine(const_track("a", 0.1, frames=100))
+    eng.swap_audio([np.ones((80, 2), np.float32)])
+    assert eng.tracks[0].data.shape == (100, 2) and not eng.tracks[0].data[80:].any()
+    eng.swap_audio([np.ones((120, 2), np.float32)])
+    assert eng.tracks[0].data.shape == (100, 2)
+    with pytest.raises(ValueError):
+        eng.swap_audio([])
+
+
+def test_stop_releases_tail_data():
+    eng = sine_engine()
+    eng.play()
+    render(eng, 100)
+    eng.swap_audio([eng.tracks[0].data.copy()])
+    assert eng.tracks[0].tail_data is not None
+    eng.stop()
+    assert eng.tracks[0].tail_data is None

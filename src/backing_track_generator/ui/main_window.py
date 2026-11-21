@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QSpinBox,
     QStyle,
     QToolButton,
     QVBoxLayout,
@@ -24,12 +25,33 @@ from ..audio_io import AudioLoadError, load_audio
 from ..engine import AudioEngine, Track
 from ..separation import SeparationError, cache_dir_for, is_cached, load_stems
 from ..timefmt import format_time
+from ..transpose import MAX_SEMITONES, MIN_SEMITONES, TranspositionCache
 from .separation_job import SeparationJob
 from .timeline import TimeRuler, Timeline
 from .track_lane import HEADER_WIDTH, TrackLane
+from .transpose_job import TransposeJob
 
 AUDIO_FILTER = "Audio files (*.wav *.flac *.mp3 *.ogg *.m4a *.aac *.opus *.aiff *.aif);;All files (*)"
 UI_REFRESH_MS = 30
+TRANSPOSE_DEBOUNCE_MS = 350  # wait for the user to stop clicking before rendering
+
+
+class SemitoneSpinBox(QSpinBox):
+    """Shows +3 / 0 / -2. Takes no keyboard focus so Space keeps playing/pausing;
+    change it with its arrows, the mouse wheel, or the +/- shortcuts."""
+
+    def __init__(self):
+        super().__init__()
+        self.setRange(MIN_SEMITONES, MAX_SEMITONES)
+        self.setSuffix(" st")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setToolTip("Transpose all tracks by semitones (+ / − keys, 0 to reset)")
+
+    def textFromValue(self, value: int) -> str:
+        return f"{value:+d}" if value else "0"
+
+    def valueFromText(self, text: str) -> int:
+        return int(text.replace("st", "").strip() or 0)
 
 
 class MainWindow(QMainWindow):
@@ -47,6 +69,15 @@ class MainWindow(QMainWindow):
         self._source_path: Path | None = None
         self._separated = False
         self._job: SeparationJob | None = None
+        # Transposition: originals + cached versions for the current track set.
+        self._transpose_cache: TranspositionCache | None = None
+        self._semitones = 0  # applied to the engine
+        self._transpose_job: TransposeJob | None = None
+        self._track_generation = 0  # bumps whenever the track set changes
+        self._transpose_timer = QTimer(self)
+        self._transpose_timer.setSingleShot(True)
+        self._transpose_timer.setInterval(TRANSPOSE_DEBOUNCE_MS)
+        self._transpose_timer.timeout.connect(self._apply_transpose)
 
         self._build_actions()
         self._build_ui()
@@ -90,6 +121,16 @@ class MainWindow(QMainWindow):
         self.act_loop_clear = QAction("&Clear loop", self)
         self.act_loop_clear.triggered.connect(self.timeline.clear_loop)
 
+        self.act_transpose_up = QAction("Transpose &up", self)
+        self.act_transpose_up.setShortcuts([QKeySequence("+"), QKeySequence("=")])
+        self.act_transpose_up.triggered.connect(lambda: self.transpose_spin.stepUp())
+        self.act_transpose_down = QAction("Transpose &down", self)
+        self.act_transpose_down.setShortcut(QKeySequence("-"))
+        self.act_transpose_down.triggered.connect(lambda: self.transpose_spin.stepDown())
+        self.act_transpose_reset = QAction("&Reset transpose", self)
+        self.act_transpose_reset.setShortcut(QKeySequence("0"))
+        self.act_transpose_reset.triggered.connect(lambda: self.transpose_spin.setValue(0))
+
         self.act_separate = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload), "&Separate into stems", self)
         self.act_separate.setShortcut("Ctrl+E")
@@ -120,6 +161,10 @@ class MainWindow(QMainWindow):
         transport_menu.addAction(self.act_loop_in)
         transport_menu.addAction(self.act_loop_out)
         transport_menu.addAction(self.act_loop_clear)
+        transport_menu.addSeparator()
+        transport_menu.addAction(self.act_transpose_up)
+        transport_menu.addAction(self.act_transpose_down)
+        transport_menu.addAction(self.act_transpose_reset)
 
     def _build_ui(self) -> None:
         tb = self.addToolBar("Transport")
@@ -130,6 +175,11 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_play)
         tb.addAction(self.act_stop)
         tb.addAction(self.act_loop)
+        tb.addSeparator()
+        tb.addWidget(QLabel(" Transpose "))
+        self.transpose_spin = SemitoneSpinBox()
+        self.transpose_spin.valueChanged.connect(self._on_transpose_value_changed)
+        tb.addWidget(self.transpose_spin)
         tb.addSeparator()
         self.time_label = QLabel()
         self.time_label.setStyleSheet("font-family: monospace; font-size: 14pt; padding: 0 8px;")
@@ -175,6 +225,14 @@ class MainWindow(QMainWindow):
             self.statusBar().addPermanentWidget(w)
             w.hide()
 
+        # Transposition progress.
+        self.tr_label = QLabel()
+        self.tr_progress = QProgressBar()
+        self.tr_progress.setFixedWidth(140)
+        for w in (self.tr_label, self.tr_progress):
+            self.statusBar().addPermanentWidget(w)
+            w.hide()
+
     # ----- loading -------------------------------------------------------
 
     def _on_open(self) -> None:
@@ -207,6 +265,8 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def _set_tracks(self, tracks: list[Track], sample_rate: int, keep_transport: bool = False) -> None:
+        """Load a new track set. ``keep_transport``: same song (original ->
+        stems), so keep position, play state, loop and transposition."""
         position, playing = self.engine.position, self.engine.is_playing
         loop, loop_on = self.timeline.loop, self.timeline.loop_enabled
         self.engine.load(tracks, sample_rate)
@@ -217,7 +277,96 @@ class MainWindow(QMainWindow):
             self.engine.seek(position)
             if playing:
                 self.engine.play()
+        self._reset_transposition(keep_value=keep_transport)
         self._refresh()
+
+    # ----- transposition -------------------------------------------------
+
+    def _reset_transposition(self, keep_value: bool) -> None:
+        """New track set loaded at original pitch: start over, re-rendering the
+        current transposition for the new tracks if it should be kept."""
+        self._cancel_transpose_job()
+        self._track_generation += 1
+        self._transpose_cache = TranspositionCache([(t.name, t.data) for t in self.engine.tracks])
+        self._semitones = 0
+        if not keep_value:
+            self.transpose_spin.blockSignals(True)
+            self.transpose_spin.setValue(0)
+            self.transpose_spin.blockSignals(False)
+        self._apply_transpose()
+
+    def _on_transpose_value_changed(self, _value: int) -> None:
+        self._transpose_timer.start()  # (re)start the debounce
+
+    def _apply_transpose(self) -> None:
+        self._transpose_timer.stop()
+        target = self.transpose_spin.value()
+        cache = self._transpose_cache
+        if cache is None:
+            return
+        job = self._transpose_job
+        if job is not None and job.semitones == target and job.generation == self._track_generation:
+            return  # already rendering this
+        self._cancel_transpose_job()
+        datas = cache.get(target)
+        if datas is not None:
+            if target != self._semitones:
+                self.engine.swap_audio(datas)
+                self._semitones = target
+            self._update_transpose_status()
+            return
+        job = TransposeJob(cache.originals, self.engine.sample_rate, target, self._track_generation, parent=self)
+        job.progress.connect(self._on_transpose_progress)
+        job.finished.connect(self._on_transpose_finished)
+        job.failed.connect(self._on_transpose_failed)
+        job.done.connect(job.deleteLater)
+        self._transpose_job = job
+        job.start()
+        self._on_transpose_progress(0.0)
+
+    def _cancel_transpose_job(self) -> None:
+        if self._transpose_job is not None:
+            self._transpose_job.cancel()  # it deletes itself when its thread ends
+            self._transpose_job = None
+        self._update_transpose_status()
+
+    def _on_transpose_progress(self, _fraction: float) -> None:
+        job = self._transpose_job
+        if job is None:
+            return
+        self.tr_label.setText(f"Transposing {job.semitones:+d}…")
+        # Tracks render in parallel and finish together, so a percentage would
+        # sit at 0% then jump: show a busy indicator instead.
+        self.tr_progress.setRange(0, 0)
+        self.tr_label.show()
+        self.tr_progress.show()
+
+    def _on_transpose_finished(self, semitones: int, datas: list) -> None:
+        job = self.sender()
+        if job is not self._transpose_job or job.generation != self._track_generation:
+            return  # stale result for an old track set
+        self._transpose_job = None
+        self._transpose_cache.put(semitones, datas)
+        if semitones == self.transpose_spin.value():
+            self.engine.swap_audio(datas)
+            self._semitones = semitones
+        self._update_transpose_status()
+        self._apply_transpose()  # in case the target moved on meanwhile
+
+    def _on_transpose_failed(self, message: str) -> None:
+        if self.sender() is not self._transpose_job:
+            return
+        self._transpose_job = None
+        self._update_transpose_status()
+        self.transpose_spin.blockSignals(True)
+        self.transpose_spin.setValue(self._semitones)  # back to what's playing
+        self.transpose_spin.blockSignals(False)
+        QMessageBox.warning(self, "Transpose failed", message)
+
+    def _update_transpose_status(self) -> None:
+        if self._transpose_job is None:
+            self.tr_label.hide()
+            self.tr_progress.hide()
 
     # ----- separation ----------------------------------------------------
 
@@ -399,9 +548,20 @@ class MainWindow(QMainWindow):
         self.act_loop_clear.setEnabled(self.timeline.loop is not None)
         self.act_separate.setEnabled(
             self._source_path is not None and self._job is None and not self._separated)
+        for w in (self.transpose_spin, self.act_transpose_up, self.act_transpose_down, self.act_transpose_reset):
+            w.setEnabled(loaded)
+
+    @property
+    def semitones(self) -> int:
+        """Transposition currently heard."""
+        return self._semitones
 
     def closeEvent(self, event):
         self.cancel_separation()
+        job = self._transpose_job
+        self._cancel_transpose_job()
+        if job is not None:
+            job.wait(2)
         self._timer.stop()
         self.engine.close()
         super().closeEvent(event)

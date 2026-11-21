@@ -31,6 +31,8 @@ class Track:
     # Gain currently applied by the mixer; ramps towards the target gain.
     # Owned by the engine (audio thread).
     level: float = 0.0
+    # During a crossfade after swap_audio(): the previous audio, faded out.
+    tail_data: np.ndarray | None = None
 
 
 def audible_tracks(tracks: list[Track]) -> list[Track]:
@@ -163,7 +165,7 @@ class AudioEngine:
         """Stop and rewind: to the loop start if looping, else to the beginning."""
         with self._lock:
             self._playing = False
-            self._xfade_left = 0
+            self._end_crossfade()
             self._pos = self._loop_start if self._loop_active() else 0
 
     def seek(self, seconds: float) -> None:
@@ -200,10 +202,36 @@ class AudioEngine:
     # ----- audio ---------------------------------------------------------
 
     def _begin_crossfade(self, tail: int) -> None:
-        # If a crossfade is already running, its tail is what's currently loudest
-        # only for the first half; restarting from the old tail is good enough.
+        """Start fading from position ``tail`` (same audio) to the playhead."""
+        # If a crossfade is already running, restarting from the old tail is good enough.
+        for t in self._tracks:
+            t.tail_data = None
         self._xfade_tail = tail
         self._xfade_left = max(int(CROSSFADE_SECONDS * self._sample_rate), 1)
+
+    def _end_crossfade(self) -> None:
+        self._xfade_left = 0
+        for t in self._tracks:
+            t.tail_data = None  # don't keep a whole old version alive
+
+    def swap_audio(self, datas: list[np.ndarray]) -> None:
+        """Replace every track's audio (e.g. a transposed version) keeping
+        position, loop, mute/solo and play state. Arrays are padded/trimmed to
+        the current length. While playing, the old audio crossfades into the new."""
+        if len(datas) != len(self._tracks):
+            raise ValueError("swap_audio: track count mismatch")
+        fitted = []
+        for d in datas:
+            if d.shape[0] < self._length:
+                d = np.concatenate([d, np.zeros((self._length - d.shape[0], CHANNELS), np.float32)])
+            fitted.append(d[: self._length])
+        with self._lock:
+            if self._playing:
+                self._begin_crossfade(self._pos)
+                for t in self._tracks:
+                    t.tail_data = t.data
+            for t, d in zip(self._tracks, fitted):
+                t.data = d
 
     def render_block(self, out: np.ndarray) -> None:
         """Fill ``out`` (frames, 2) with the next block and advance the playhead,
@@ -228,7 +256,7 @@ class AudioEngine:
                         self._pos = self._loop_start
                     else:
                         self._playing = False
-                        self._xfade_left = 0
+                        self._end_crossfade()
         np.clip(out, -1.0, 1.0, out=out)
 
     def _mix_segment(self, out: np.ndarray, pos: int, n: int) -> None:
@@ -245,6 +273,9 @@ class AudioEngine:
             xfade = (tail, w_in, w_out)
             self._xfade_tail += n
             self._xfade_left -= n
+            end_of_xfade = self._xfade_left == 0
+        else:
+            end_of_xfade = False
 
         audible = audible_tracks(self._tracks)
         step = np.float32(1.0 / max(GAIN_RAMP_SECONDS * self._sample_rate, 1.0))
@@ -265,10 +296,12 @@ class AudioEngine:
             seg = t.data[pos:pos + n]
             if xfade is not None:
                 tail, w_in, w_out = xfade
-                old = t.data[tail:tail + n]
+                old = (t.tail_data if t.tail_data is not None else t.data)[tail:tail + n]
                 seg = seg * w_in
                 seg[: old.shape[0]] += old * w_out[: old.shape[0]]  # tail may run past the end
             out += seg if gain is None else seg * gain
+        if end_of_xfade:
+            self._end_crossfade()
 
     def _callback(self, outdata, frames, time, status) -> None:  # noqa: ARG002
         self.render_block(outdata)

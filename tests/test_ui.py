@@ -234,3 +234,115 @@ def test_loop_survives_stem_swap(qapp, tmp_path):
     assert win.timeline.loop == (pytest.approx(1.0), pytest.approx(2.0))
     assert win.timeline.loop_enabled and win.engine.loop_active
     win.close()
+
+
+# ----- transpose -----------------------------------------------------------------
+
+def wait_until(qapp, cond, timeout=30.0):
+    import time
+
+    t0 = time.time()
+    while not cond():
+        if time.time() - t0 > timeout:
+            raise TimeoutError
+        qapp.processEvents()
+        time.sleep(0.01)
+
+
+def stems_window(tmp_path, seconds=2.0):
+    path = make_song(tmp_path, seconds)
+    t = np.arange(int(44100 * seconds)) / 44100
+    tone = lambda f: np.repeat((0.3 * np.sin(2 * np.pi * f * t)).astype(np.float32)[:, None], 2, axis=1)  # noqa: E731
+    write_stems(cache_dir_for(path), [Stem("bass", tone(110)), Stem("vocals", tone(440))],
+                44100, source=path.name, model="htdemucs_6s")
+    win = make_window()
+    win.open_file(path)  # cache hit: stems load immediately
+    assert win._separated
+    return win, path
+
+
+rubberband = pytest.mark.skipif(not __import__("shutil").which("rubberband"), reason="no rubberband")
+
+
+@rubberband
+def test_transpose_applies_and_caches(qapp, tmp_path):
+    win, _ = stems_window(tmp_path)
+    originals = [t.data for t in win.engine.tracks]
+    win._lanes[0].mute_button.click()
+    win.timeline.set_loop(0.5, 1.5, enabled=True)
+    win.engine.seek(0.7)
+
+    win.transpose_spin.setValue(3)
+    assert win.semitones == 0  # debounced, rendering in background
+    wait_until(qapp, lambda: win.semitones == 3)
+    assert not any(np.shares_memory(t.data, o) for t, o in zip(win.engine.tracks, originals))
+    assert win.engine.tracks[0].mute and win.engine.loop_active
+    assert win.engine.position == pytest.approx(0.7, abs=0.01)
+    assert not win.tr_progress.isVisible()
+
+    # Back to 0 and again to +3: both cached, applied without a job.
+    for value in (0, 3):
+        win.transpose_spin.setValue(value)
+        win._apply_transpose()  # skip the debounce wait
+        assert win._transpose_job is None and win.semitones == value
+    assert not any(np.shares_memory(t.data, o) for t, o in zip(win.engine.tracks, originals))
+    win.act_transpose_reset.trigger()
+    win._apply_transpose()
+    assert all(np.shares_memory(t.data, o) for t, o in zip(win.engine.tracks, originals))
+    win.close()
+
+
+@rubberband
+def test_rapid_changes_only_render_final_value(qapp, tmp_path):
+    win, _ = stems_window(tmp_path)
+    for _ in range(4):
+        win.act_transpose_down.trigger()
+    assert win.transpose_spin.value() == -4
+    assert win._transpose_job is None  # debounce: nothing started yet
+    wait_until(qapp, lambda: win.semitones == -4)
+    assert win._transpose_cache.cached() == [0, -4]
+    win.close()
+
+
+@rubberband
+def test_transpose_survives_stem_swap_and_resets_on_new_file(qapp, tmp_path):
+    path = make_song(tmp_path, 2.0)
+    write_stems(cache_dir_for(path), [Stem("bass", np.full((88200, 2), 0.1, np.float32))],
+                44100, source=path.name, model="htdemucs_6s")
+    win = make_window()
+    win.open_file(path, separate=False)
+    win.transpose_spin.setValue(2)
+    wait_until(qapp, lambda: win.semitones == 2)
+
+    win.start_separation()  # stems arrive at original pitch -> re-rendered at +2
+    assert [t.name for t in win.engine.tracks] == ["bass"]
+    assert win.transpose_spin.value() == 2
+    wait_until(qapp, lambda: win.semitones == 2 and win._transpose_job is None)
+    assert win._transpose_cache.originals[0][0] == "bass"
+
+    other = tmp_path / "other"
+    other.mkdir()
+    win.open_file(make_song(other, 1.0), separate=False)
+    assert win.transpose_spin.value() == 0 and win.semitones == 0
+    win.close()
+
+
+def test_transpose_failure_reverts_value(qapp, tmp_path, monkeypatch):
+    from backing_track_generator.ui import main_window
+
+    warnings = []
+    monkeypatch.setattr(main_window.QMessageBox, "warning", lambda *a: warnings.append(a[2]))
+    fake = tmp_path / "bin" / "rubberband"
+    fake.parent.mkdir()
+    fake.write_text("#!/bin/sh\necho nope >&2\nexit 1\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake.parent))
+
+    win = make_window()
+    win.open_file(make_song(tmp_path), separate=False)
+    win.transpose_spin.setValue(5)
+    win._apply_transpose()
+    wait_until(qapp, lambda: warnings)
+    assert "nope" in warnings[0]
+    assert win.transpose_spin.value() == 0 and win.semitones == 0
+    win.close()
