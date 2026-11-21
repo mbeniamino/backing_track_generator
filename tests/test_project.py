@@ -21,6 +21,9 @@ def settings(**kw):
         tracks=[TrackSettings("vocals", mute=True), TrackSettings("drums", solo=True), TrackSettings("other/stuff")],
         source_name="song.mp3", source_path="/music/song.mp3", separated=True, model="htdemucs_6s",
         transpose=-3, loop=(1.5, 4.25), loop_enabled=True, position=2.0,
+        beats={"beats": [0.5, 1.0, 1.5], "downbeats": [0.5], "corrections": {"tempo": 1, "half_beat": False,
+                                                                             "bar_offset": 0}},
+        metronome={"mute": True, "solo": False, "gain": 0.5},
     )
     base.update(kw)
     return ProjectSettings(**base)

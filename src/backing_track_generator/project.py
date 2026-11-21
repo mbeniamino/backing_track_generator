@@ -53,6 +53,10 @@ class ProjectSettings:
     loop: tuple[float, float] | None = None
     loop_enabled: bool = False
     position: float = 0.0
+    # Beat grid as detected plus the user's corrections:
+    # {"beats": [...], "downbeats": [...], "corrections": {...}}; None = not detected yet.
+    beats: dict | None = None
+    metronome: dict | None = None  # {"mute": bool, "solo": bool, "gain": float}
     extra: dict = field(default_factory=dict)  # unknown keys, preserved on re-save
 
 
@@ -89,6 +93,8 @@ def _settings_json(settings: ProjectSettings, files: list[tuple[str, float]]) ->
         "loop": None if settings.loop is None else {
             "start": settings.loop[0], "end": settings.loop[1], "enabled": settings.loop_enabled},
         "position": settings.position,
+        "beats": settings.beats,
+        "metronome": settings.metronome,
         "tracks": [
             {**asdict(t), "file": f"{TRACKS_DIR}/{fname}", "file_gain": file_gain}
             for t, (fname, file_gain) in zip(settings.tracks, files)
@@ -143,7 +149,15 @@ def _read_json(path: Path) -> dict:
 
 
 _KNOWN_KEYS = {"format", "version", "source", "separated", "model", "sample_rate", "transpose", "loop",
-               "position", "tracks"}
+               "position", "tracks", "beats", "metronome"}
+
+
+def track_files(path: str | Path) -> tuple[list[str], list[float]]:
+    """Paths and FLAC gains of a saved project's tracks (for beat detection)."""
+    pfile = project_file(path)
+    doc = _read_json(pfile)
+    entries = doc.get("tracks") or []
+    return ([str(pfile.parent / t["file"]) for t in entries], [float(t.get("file_gain", 1.0)) for t in entries])
 
 
 def load_project(path: str | Path) -> tuple[ProjectSettings, list[np.ndarray], Path]:
@@ -171,6 +185,8 @@ def load_project(path: str | Path) -> tuple[ProjectSettings, list[np.ndarray], P
             loop=None if not loop else (float(loop["start"]), float(loop["end"])),
             loop_enabled=bool(loop and loop.get("enabled", False)),
             position=float(doc.get("position", 0.0)),
+            beats=doc.get("beats") if isinstance(doc.get("beats"), dict) else None,
+            metronome=doc.get("metronome") if isinstance(doc.get("metronome"), dict) else None,
             extra={k: v for k, v in doc.items() if k not in _KNOWN_KEYS},
         )
     except (KeyError, TypeError, ValueError) as e:

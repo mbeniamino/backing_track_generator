@@ -55,7 +55,7 @@ app/
 5. ✅ Transpose ±12 st: Rubber Band R3 (formant-preserving for vocals), parallel per stem, debounced, LRU cache of 2 versions, crossfaded hot-swap.
 6. ✅ Projects: folder with project.json + tracks/*.flac (original pitch); Save/Save As/Open, dirty tracking + prompt, settings-only re-save, atomic writes.
 7. ✅ Render: audible tracks at current transposition (whole song or loop) to WAV/FLAC/MP3/Ogg; scaled instead of clipped.
-8. (Future) Tempo/beat tracking (`beat_this` / `madmom`) → metronome track, count-in intro.
+8. ✅ Beats with beat_this → metronome track (follows tempo changes), count-in, manual corrections (×2, ÷2, bar start, half-beat).
 
 ## Risks
 - torch/Demucs compatibility → pinned Python 3.12 venv.

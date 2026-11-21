@@ -63,9 +63,15 @@ def is_cached(stem_dir: Path) -> bool:
     return (stem_dir / MANIFEST).is_file()
 
 
-def write_stems(stem_dir: Path, stems: list[Stem], sample_rate: int, source: str, model: str) -> None:
-    """Write stems as 24-bit FLAC plus a manifest, atomically."""
+def write_stems(stem_dir: Path, stems: list[Stem], sample_rate: int, source: str, model: str,
+                beats=None) -> None:
+    """Write stems as 24-bit FLAC plus a manifest (and the beat grid, if
+    given), atomically."""
     with staged_dir(stem_dir) as tmp:
+        if beats is not None:
+            from .beats import BEATS_FILE, write_beats_file
+
+            write_beats_file(tmp / BEATS_FILE, beats)
         entries = []
         for stem in stems:
             fname = f"{stem.name}.flac"
@@ -134,6 +140,7 @@ def separate(
     report = progress or (lambda f, m: None)
     report(None, "Loading audio…")
     mix, sr = load_audio(input_path)
+    mix_sr = sr
 
     report(None, "Loading model…")
     import torch
@@ -175,10 +182,19 @@ def separate(
     # stems (demucs' CLI adds it to every stem) so that they still sum to the mix.
     out = out * std + mean / len(model.sources)
 
-    report(1.0, "Writing stems…")
     stems = [Stem(name, np.ascontiguousarray(out[i].numpy().T, dtype=np.float32))
              for i, name in enumerate(model.sources)]
-    write_stems(stem_dir, stems, sr, source=Path(input_path).name, model=model_name)
+
+    # Beats come from the original mix; a failure here must not lose the stems.
+    report(None, "Detecting beats…")
+    from .beats import BeatError, detect_beats
+
+    try:
+        grid = detect_beats(mix, mix_sr)
+    except BeatError:
+        grid = None
+    report(1.0, "Writing stems…")
+    write_stems(stem_dir, stems, sr, source=Path(input_path).name, model=model_name, beats=grid)
     return stem_dir
 
 
@@ -216,6 +232,38 @@ def load_model(model_name: str, on_download: Callable[[], None] | None = None):
 
 
 # ----- worker process --------------------------------------------------------
+
+def run_beats_worker(audio_paths: list[str], gains: list[float], out_file: str, queue) -> None:
+    """Subprocess entry point: detect beats on the sum of ``audio_paths``
+    (e.g. a song's stems) and write the grid to ``out_file``. Same messages
+    as ``run_worker``."""
+    try:
+        from .audio_io import load_audio_scaled
+        from .beats import detect_beats, write_beats_file
+
+        queue.put(("progress", None, "Detecting beats…"))
+        mix, sr = None, None
+        for path, gain in zip(audio_paths, gains):
+            data, file_sr = load_audio_scaled(path, gain)
+            if mix is None:
+                mix, sr = data.copy(), file_sr
+            else:
+                n = min(len(mix), len(data))
+                mix[:n] += data[:n]
+        if mix is None:
+            raise SeparationError("No audio to analyse")
+        write_beats_file(Path(out_file), detect_beats(mix, sr))
+        queue.put(("done", out_file))
+    except Exception as e:  # report everything to the GUI
+        queue.put(("error", f"{type(e).__name__}: {e}"))
+
+
+def stem_files(stem_dir: Path) -> tuple[list[str], list[float]]:
+    """Paths and gains of a cached separation's stems (for the beats worker)."""
+    manifest = json.loads((stem_dir / MANIFEST).read_text())
+    return ([str(stem_dir / e["file"]) for e in manifest["stems"]],
+            [float(e.get("gain", 1.0)) for e in manifest["stems"]])
+
 
 def run_worker(input_path: str, stem_dir: str, model_name: str, queue) -> None:
     """Entry point of the separation subprocess. Posts messages to ``queue``:

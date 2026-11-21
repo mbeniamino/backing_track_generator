@@ -881,3 +881,217 @@ def test_limit_enforced_after_separation(qapp, tmp_path):
     assert "removed 1 song" in win.statusBar().currentMessage()
     assert AppSettings().cache_limit == 1
     win.close()
+
+
+# ----- beats, metronome, count-in ---------------------------------------------------
+
+def beats_song(tmp_path, seconds=4.0, bpm=120.0, with_beats=True):
+    """A cached separation (bass + vocals) with a steady beat grid."""
+    from backing_track_generator.beats import BeatGrid
+
+    path = make_song(tmp_path, seconds)
+    frames = int(44100 * seconds)
+    beats = np.arange(0.25, seconds - 0.1, 60 / bpm)
+    grid = BeatGrid(beats, beats[::4]) if with_beats else None
+    write_stems(cache_dir_for(path), [Stem("bass", np.full((frames, 2), 0.05, np.float32)),
+                                      Stem("vocals", np.full((frames, 2), 0.02, np.float32))],
+                44100, source=path.name, model="htdemucs_6s", beats=grid)
+    return path
+
+
+class FakeBeatJob:
+    """Stands in for the beat-detection subprocess."""
+    instances = []
+
+    def __init__(self, paths, gains, out_file, parent=None):
+        from PySide6.QtCore import QObject, Signal
+
+        class Sig(QObject):
+            finished = Signal(object)
+            failed = Signal(str)
+
+        self._sig = Sig()
+        self.finished, self.failed = self._sig.finished, self._sig.failed
+        self.paths, self.gains, self.out_file = paths, gains, out_file
+        self.cancelled = False
+        FakeBeatJob.instances.append(self)
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
+
+    def deleteLater(self):
+        pass
+
+
+def test_metronome_track_from_cached_beats(qapp, tmp_path):
+    path = beats_song(tmp_path)
+    win = make_window()
+    win.open_file(path)
+    names = [t.name for t in win.engine.tracks]
+    assert names == ["vocals", "bass", "metronome"] and win.engine.tracks[2].kind == "metronome"
+    assert win.lanes_layout.itemAt(0).widget() is win._lanes[2]  # shown at the top
+    assert win.engine.tracks[2].gain == pytest.approx(0.7)
+    # clicks on the beats
+    click = win.engine.tracks[2].data[:, 0]
+    assert np.abs(click[int(0.25 * 44100): int(0.25 * 44100) + 400]).max() > 0.1
+    assert not click[: int(0.24 * 44100)].any()
+    assert win.act_count_in.isEnabled() and win.act_tempo_double.isEnabled()
+    win.engine.seek(0.8)
+    win._refresh()
+    assert win.beat_label.text() == "Bar 1.2  ·  120 BPM"
+    # The metronome has its own vertical scale.
+    assert win._lanes[2].waveform._reference_peak == pytest.approx(win._lanes[2].waveform.peak)
+    # Mute / volume work like any track.
+    win._lanes[2].mute_button.click()
+    assert win.engine.tracks[2].mute
+    win.close()
+
+
+def test_transposition_leaves_metronome_alone(qapp, tmp_path):
+    win = make_window()
+    win.open_file(beats_song(tmp_path))
+    click = win.engine.tracks[2].data
+    assert [n for n, _ in win._transpose_cache.originals] == ["vocals", "bass"]
+    shifted = [d * 0.5 for _, d in win._transpose_cache.originals]
+    win._swap_audio(shifted)
+    assert np.shares_memory(win.engine.tracks[2].data, click)
+    np.testing.assert_allclose(win.engine.tracks[0].data, shifted[0])
+    win.close()
+
+
+def test_beat_corrections_regenerate_metronome(qapp, tmp_path):
+    win = make_window()
+    win.open_file(beats_song(tmp_path))
+    before = win.engine.tracks[2].data.copy()
+    win.engine.seek(1.0)
+    win.act_tempo_double.trigger()
+    assert win._beat_grid.tempo_at(1.0) == pytest.approx(240)
+    assert not np.array_equal(win.engine.tracks[2].data, before)
+    assert len(win._lanes) == 3 and win.lanes_layout.itemAt(0).widget() is win._lanes[2]
+    win.act_bar_later.trigger()
+    win.act_half_beat.trigger()
+    assert win._beat_corrections.tempo == 1 and win._beat_corrections.bar_offset == 1
+    assert win._beat_corrections.half_beat
+    win.act_beats_reset.trigger()
+    np.testing.assert_allclose(win.engine.tracks[2].data, before)
+    assert not win.act_half_beat.isChecked()
+    win.close()
+
+
+def test_count_in_before_playback(qapp, tmp_path):
+    win = make_window()
+    win.open_file(beats_song(tmp_path))
+    win._lanes[2].mute_button.click()  # count-in plays even with the metronome muted
+    win.act_count_in.setChecked(True)
+    win.engine.seek(0.0)
+    win.act_play.trigger()
+    assert win.engine.counting_in and win.engine.is_playing
+    # first beat at 0.25 s, 4 beats at 0.5 s -> count-in starts at -1.75 s
+    assert win.engine.count_in_remaining == pytest.approx(1.75, abs=0.01)
+    win._refresh()
+    assert "count-in" in win.time_label.text()
+    out = np.zeros((int(44100 * 1.75), 2), np.float32)
+    win.engine.render_block(out)
+    assert np.abs(out[:400, 0]).max() > 0.1  # the "1" click
+    assert not win.engine.counting_in and win.engine.position == pytest.approx(0.0, abs=0.001)
+
+    win.act_play.trigger()  # pause: no count-in involved
+    win.act_count_in.setChecked(False)
+    win.act_play.trigger()
+    assert not win.engine.counting_in
+    assert AppSettingsCountIn() is False
+    win.close()
+
+
+def AppSettingsCountIn():
+    from backing_track_generator.ui.settings import AppSettings
+
+    return AppSettings().count_in
+
+
+def test_beats_saved_in_project_and_restored(qapp, tmp_path, dialogs):
+    win = make_window()
+    win.open_file(beats_song(tmp_path))
+    win.act_tempo_halve.trigger()
+    win._lanes[2].volume.setValue(-10)
+    win._lanes[2].solo_button.click()
+    dialogs["save_path"] = tmp_path / "p"
+    win.save_project_as()
+    assert sorted(f.name for f in (tmp_path / "p" / "tracks").iterdir()) == ["bass.flac", "vocals.flac"]
+    import json
+
+    doc = json.loads((tmp_path / "p" / "project.json").read_text())
+    assert [t["name"] for t in doc["tracks"]] == ["vocals", "bass"]
+    assert doc["beats"]["corrections"]["tempo"] == -1 and doc["metronome"]["solo"] is True
+    win.close()
+
+    win2 = make_window()
+    win2.open_project(tmp_path / "p")
+    assert [t.name for t in win2.engine.tracks] == ["vocals", "bass", "metronome"]
+    m = win2.engine.tracks[2]
+    assert m.solo and m.gain == pytest.approx(10 ** (-10 / 20))
+    assert win2._beat_corrections.tempo == -1 and win2._beat_grid.tempo_at(1.0) == pytest.approx(60)
+    assert not win2._dirty
+    win2.close()
+
+
+def test_missing_beats_are_detected_in_background(qapp, tmp_path, monkeypatch, dialogs):
+    from backing_track_generator.beats import BeatGrid, write_beats_file
+    from backing_track_generator.ui import main_window
+
+    FakeBeatJob.instances.clear()
+    monkeypatch.setattr(main_window, "BeatJob", FakeBeatJob)
+    path = beats_song(tmp_path, with_beats=False)
+    win = make_window()
+    win.open_file(path)
+    assert [t.name for t in win.engine.tracks] == ["vocals", "bass"]  # no metronome yet
+    job = FakeBeatJob.instances[-1]
+    assert job.out_file == cache_dir_for(path) / "beats.json" and len(job.paths) == 2
+    assert not win.act_count_in.isEnabled()
+
+    write_beats_file(job.out_file, BeatGrid(np.arange(0.5, 3.5, 0.5), [0.5, 2.5]))
+    win._beats_job = job  # the window checks the sender is its current job
+    monkeypatch.setattr(win, "sender", lambda: job)
+    job.finished.emit(job.out_file)
+    assert [t.name for t in win.engine.tracks] == ["vocals", "bass", "metronome"]
+    assert win.act_count_in.isEnabled()
+
+    # A project saved without beats gets them detected (to a temp file) and becomes dirty.
+    dialogs["save_path"] = tmp_path / "p"
+    win.save_project_as()
+    import json
+
+    doc = json.loads((tmp_path / "p" / "project.json").read_text())
+    doc["beats"] = None
+    (tmp_path / "p" / "project.json").write_text(json.dumps(doc))
+    win.close()
+
+    win2 = make_window()
+    win2.open_project(tmp_path / "p")
+    job2 = FakeBeatJob.instances[-1]
+    assert job2.paths[0].endswith(".flac") and job2.out_file != cache_dir_for(path) / "beats.json"
+    write_beats_file(job2.out_file, BeatGrid(np.arange(0.5, 3.5, 0.5), [0.5, 2.5]))
+    monkeypatch.setattr(win2, "sender", lambda: job2)
+    job2.finished.emit(job2.out_file)
+    assert win2._metronome_index() is not None and win2._dirty
+    assert not job2.out_file.exists()  # temp file cleaned up
+    win2._dirty = False
+    win2.close()
+
+
+def test_render_includes_audible_metronome(qapp, tmp_path):
+    from backing_track_generator.audio_io import load_audio
+
+    win = make_window()
+    win.open_file(beats_song(tmp_path))
+    with_click = win.render_to_file(path=tmp_path / "a.wav")
+    assert "metronome" in win.statusBar().currentMessage()
+    win._lanes[2].mute_button.click()
+    without = win.render_to_file(path=tmp_path / "b.wav")
+    a, _ = load_audio(with_click)
+    b, _ = load_audio(without)
+    assert np.abs(a - b).max() > 0.1
+    win.close()

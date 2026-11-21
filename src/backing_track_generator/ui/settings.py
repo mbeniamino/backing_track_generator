@@ -33,6 +33,16 @@ class AppSettings:
         except (TypeError, ValueError):
             return DEFAULT_CACHE_LIMIT
 
+    @property
+    def count_in(self) -> bool:
+        """Play one bar of clicks before playback starts."""
+        return str(self._qs.value("transport/count_in", "false")).lower() in ("true", "1")
+
+    @count_in.setter
+    def count_in(self, on: bool) -> None:
+        self._qs.setValue("transport/count_in", "true" if on else "false")
+        self._qs.sync()
+
     @cache_limit.setter
     def cache_limit(self, limit: int | None) -> None:
         self._qs.setValue("cache/limit_bytes", "none" if limit is None else int(limit))

@@ -26,6 +26,7 @@ INACTIVE = QColor("#4a4f5c")
 
 # Each stem gets its own color; other names cycle through the extras.
 STEM_COLORS = {
+    "metronome": QColor("#d8dce8"),
     "vocals": QColor("#ff5c8a"),
     "guitar": QColor("#ff9f43"),
     "piano": QColor("#ffd93d"),
@@ -74,6 +75,7 @@ QLabel#timeDisplay {{ font-family: "JetBrains Mono", "Fira Code", "DejaVu Sans M
     font-size: 20pt; font-weight: 600; color: {TEXT.name()}; background: #0b0c10;
     border: 1px solid {BORDER.name()}; border-radius: 8px; padding: 2px 12px; }}
 QLabel#loopDisplay {{ font-family: monospace; color: {LOOP.name()}; padding: 0 6px; }}
+QLabel#beatDisplay {{ font-family: monospace; color: {TEXT.name()}; padding: 0 6px; }}
 QLabel#toolbarCaption {{ color: {TEXT_DIM.name()}; font-size: 8pt; font-weight: 600;
     letter-spacing: 1px; padding-left: 4px; }}
 QLabel#placeholder {{ color: {TEXT_DIM.name()}; font-size: 15pt; }}
@@ -196,6 +198,19 @@ def _draw_icon(p: QPainter, kind: str, c: QColor) -> None:
         p.drawPath(path)
         p.drawRect(QRectF(8, 4, 7, 5))
         p.drawRect(QRectF(7.5, 13, 9, 7))
+    elif kind == "metronome":
+        # a metronome body with its pendulum
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        body = QPainterPath(QPointF(8, 4))
+        for x, y in ((16, 4), (20, 20), (4, 20)):
+            body.lineTo(x, y)
+        body.closeSubpath()
+        p.drawPath(body)
+        p.drawLine(QPointF(6, 16), QPointF(18, 16))
+        p.drawLine(QPointF(12, 16), QPointF(17, 6))
+        p.setBrush(c)
+        p.drawEllipse(QPointF(15.5, 9), 1.6, 1.6)
     elif kind == "split":
         # one waveform line fanning out into three
         p.setPen(pen)

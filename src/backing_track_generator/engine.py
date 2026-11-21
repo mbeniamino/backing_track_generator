@@ -33,6 +33,12 @@ class Track:
     level: float = 0.0
     # During a crossfade after swap_audio(): the previous audio, faded out.
     tail_data: np.ndarray | None = None
+    # "audio" (from the song) or "metronome" (generated: never transposed or saved as audio).
+    kind: str = "audio"
+
+    @property
+    def is_audio(self) -> bool:
+        return self.kind == "audio"
 
 
 def audible_tracks(tracks: list[Track]) -> list[Track]:
@@ -67,6 +73,12 @@ class AudioEngine:
         # playing while fading out, and how many crossfade frames remain.
         self._xfade_tail = 0
         self._xfade_left = 0
+        # Count-in: click audio laid out in song time. ``_overlay_pos`` is the
+        # overlay frame matching the next output frame (negative = not yet);
+        # ``_preroll`` output frames are played before the song starts.
+        self._overlay: np.ndarray | None = None
+        self._overlay_pos = 0
+        self._preroll = 0
 
     # ----- loading -------------------------------------------------------
 
@@ -88,6 +100,7 @@ class AudioEngine:
             self._xfade_left = 0
             self._loop_enabled = False
             self._loop_start = self._loop_end = 0
+            self._cancel_count_in()
         if sample_rate != self._sample_rate or self._stream is None:
             self._sample_rate = sample_rate
             self._open_stream()
@@ -122,6 +135,31 @@ class AudioEngine:
                     t.solo = False
             self._tracks[index].solo = solo
 
+    def add_track(self, track: Track) -> int:
+        """Append a track (fitted to the song length) without disturbing
+        playback; returns its index."""
+        track.data = self._fit(track.data)
+        track.level = 0.0  # fades in
+        with self._lock:
+            self._tracks = [*self._tracks, track]
+            return len(self._tracks) - 1
+
+    def remove_track(self, index: int) -> None:
+        with self._lock:
+            self._tracks = [t for i, t in enumerate(self._tracks) if i != index]
+
+    def set_track_data(self, index: int, data: np.ndarray) -> None:
+        """Replace one track's audio (e.g. a regenerated metronome)."""
+        data = self._fit(data)
+        with self._lock:
+            self._tracks[index].data = data
+            self._tracks[index].tail_data = None
+
+    def _fit(self, d: np.ndarray) -> np.ndarray:
+        if d.shape[0] < self._length:
+            d = np.concatenate([d, np.zeros((self._length - d.shape[0], CHANNELS), np.float32)])
+        return np.ascontiguousarray(d[: self._length], dtype=np.float32)
+
     def set_gain(self, index: int, gain: float) -> None:
         """Track volume (linear); changes are ramped like mute/solo."""
         with self._lock:
@@ -154,15 +192,53 @@ class AudioEngine:
         with self._lock:
             if self._length == 0:
                 return
-            if self._loop_active() and not self._in_loop(self._pos):
-                self._pos = self._loop_start
-            elif self._pos >= self._length:
-                self._pos = 0
+            self._pos = self._start_frame()
             self._playing = True
+
+    def _start_frame(self) -> int:
+        if self._loop_active() and not self._in_loop(self._pos):
+            return self._loop_start
+        if self._pos >= self._length:
+            return 0
+        return self._pos
+
+    @property
+    def start_position(self) -> float:
+        """Where play() would start, in seconds."""
+        with self._lock:
+            return self._start_frame() / self._sample_rate
+
+    def play_with_count_in(self, clicks: np.ndarray, clicks_start: float) -> None:
+        """Like play(), but first play ``clicks`` (audio whose first frame is at
+        song time ``clicks_start``): the part before the start position plays
+        before the song, the rest on top of it."""
+        with self._lock:
+            if self._length == 0:
+                return
+            self._pos = self._start_frame()
+            offset = self._pos - int(round(clicks_start * self._sample_rate))  # overlay frame at the start position
+            self._overlay = clicks
+            self._preroll = max(offset, 0)
+            self._overlay_pos = 0 if offset >= 0 else offset
+            self._playing = True
+
+    @property
+    def counting_in(self) -> bool:
+        """True while the count-in plays before the song starts."""
+        return self._playing and self._preroll > 0
+
+    @property
+    def count_in_remaining(self) -> float:
+        return self._preroll / self._sample_rate if self._playing else 0.0
+
+    def _cancel_count_in(self) -> None:
+        self._overlay = None
+        self._preroll = 0
 
     def pause(self) -> None:
         with self._lock:
             self._playing = False
+            self._cancel_count_in()
 
     def toggle(self) -> None:
         if self._playing:
@@ -175,6 +251,7 @@ class AudioEngine:
         with self._lock:
             self._playing = False
             self._end_crossfade()
+            self._cancel_count_in()
             self._pos = self._loop_start if self._loop_active() else 0
 
     def seek(self, seconds: float) -> None:
@@ -183,6 +260,7 @@ class AudioEngine:
             if self._playing and frame != self._pos:
                 self._begin_crossfade(self._pos)
             self._pos = frame
+            self._cancel_count_in()
 
     # ----- loop ----------------------------------------------------------
 
@@ -262,6 +340,12 @@ class AudioEngine:
             frames = out.shape[0]
             filled = 0
             while self._playing and filled < frames:
+                if self._preroll > 0:  # count-in before the song
+                    n = min(frames - filled, self._preroll)
+                    self._mix_overlay(out[filled:filled + n])
+                    self._preroll -= n
+                    filled += n
+                    continue
                 looping = self._loop_active() and self._pos < self._loop_end
                 limit = self._loop_end if looping else self._length
                 n = min(frames - filled, limit - self._pos)
@@ -269,16 +353,31 @@ class AudioEngine:
                     n = min(n, self._xfade_left)
                 if n > 0:
                     self._mix_segment(out[filled:filled + n], self._pos, n)
+                    if self._overlay is not None:
+                        self._mix_overlay(out[filled:filled + n])
                     self._pos += n
                     filled += n
                 if self._pos >= limit:
                     if looping:
                         self._begin_crossfade(self._pos)
                         self._pos = self._loop_start
+                        self._cancel_count_in()  # its clicks belong before the wrap
                     else:
                         self._playing = False
                         self._end_crossfade()
         np.clip(out, -1.0, 1.0, out=out)
+
+    def _mix_overlay(self, out: np.ndarray) -> None:
+        """Add the count-in clicks for the next ``len(out)`` frames."""
+        ov, pos, n = self._overlay, self._overlay_pos, out.shape[0]
+        self._overlay_pos += n
+        if ov is None:
+            return
+        a, b = max(pos, 0), min(pos + n, ov.shape[0])
+        if a < b:
+            out[a - pos:b - pos] += ov[a:b]
+        if self._overlay_pos >= ov.shape[0]:
+            self._overlay = None
 
     def _mix_segment(self, out: np.ndarray, pos: int, n: int) -> None:
         """Mix ``n`` frames from ``pos`` into ``out``, applying gain ramps and,

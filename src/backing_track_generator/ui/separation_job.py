@@ -1,4 +1,4 @@
-"""Runs Demucs separation in a subprocess and relays progress as Qt signals.
+"""Background worker processes (separation, beat detection) relayed as Qt signals.
 
 A separate process (rather than a thread) keeps the GUI and audio callback
 free of torch's GIL usage and makes cancellation a simple terminate().
@@ -10,24 +10,28 @@ import multiprocessing as mp
 import queue as queue_mod
 import shutil
 from pathlib import Path
+from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from ..separation import DEFAULT_MODEL, run_worker
+from ..separation import DEFAULT_MODEL, run_beats_worker, run_worker
 
 POLL_MS = 100
 
 
-class SeparationJob(QObject):
+class WorkerJob(QObject):
+    """Runs ``target(*args, queue)`` in a spawned process. The target posts
+    ("progress", fraction|None, message), then ("done", path) or ("error", message)."""
+
     progress = Signal(object, str)  # fraction (float | None), message
-    finished = Signal(Path)  # stem directory
+    finished = Signal(Path)  # the path posted with "done"
     failed = Signal(str)
 
-    def __init__(self, input_path: Path, stem_dir: Path, model: str = DEFAULT_MODEL, parent: QObject | None = None):
+    description = "Worker"
+
+    def __init__(self, target: Callable[..., None], args: tuple[Any, ...], parent: QObject | None = None):
         super().__init__(parent)
-        self.input_path = input_path
-        self.stem_dir = stem_dir
-        self.model = model
+        self._target, self._args = target, args
         self._proc: mp.Process | None = None
         self._queue = None
         self._timer = QTimer(self)
@@ -40,11 +44,7 @@ class SeparationJob(QObject):
     def start(self) -> None:
         ctx = mp.get_context("spawn")
         self._queue = ctx.Queue()
-        self._proc = ctx.Process(
-            target=run_worker,
-            args=(str(self.input_path), str(self.stem_dir), self.model, self._queue),
-            daemon=True,
-        )
+        self._proc = ctx.Process(target=self._target, args=(*self._args, self._queue), daemon=True)
         self._proc.start()
         self._timer.start(POLL_MS)
 
@@ -54,9 +54,10 @@ class SeparationJob(QObject):
         self._proc.terminate()
         self._proc.join(timeout=5)
         self._cleanup()
-        # Remove a half-written temp dir, if the worker was killed while writing.
-        for tmp in self.stem_dir.parent.glob(".tmp-*"):
-            shutil.rmtree(tmp, ignore_errors=True)
+        self._after_cancel()
+
+    def _after_cancel(self) -> None:
+        pass
 
     def _cleanup(self) -> None:
         self._timer.stop()
@@ -92,4 +93,31 @@ class SeparationJob(QObject):
         if not alive:
             code = self._proc.exitcode
             self._cleanup()
-            self.failed.emit(f"Separation process exited unexpectedly (exit code {code}).")
+            self.failed.emit(f"{self.description} process exited unexpectedly (exit code {code}).")
+
+
+class SeparationJob(WorkerJob):
+    """Separate a song into ``stem_dir`` (beats are detected too)."""
+
+    description = "Separation"
+
+    def __init__(self, input_path: Path, stem_dir: Path, model: str = DEFAULT_MODEL, parent: QObject | None = None):
+        super().__init__(run_worker, (str(input_path), str(stem_dir), model), parent)
+        self.input_path = input_path
+        self.stem_dir = stem_dir
+        self.model = model
+
+    def _after_cancel(self) -> None:
+        # Remove a half-written temp dir, if the worker was killed while writing.
+        for tmp in self.stem_dir.parent.glob(".tmp-*"):
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class BeatJob(WorkerJob):
+    """Detect beats on the sum of some audio files, writing ``out_file``."""
+
+    description = "Beat detection"
+
+    def __init__(self, audio_paths: list[str], gains: list[float], out_file: Path, parent: QObject | None = None):
+        super().__init__(run_beats_worker, (list(audio_paths), list(gains), str(out_file)), parent)
+        self.out_file = out_file

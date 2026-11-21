@@ -406,3 +406,79 @@ def test_stop_releases_tail_data():
     assert eng.tracks[0].tail_data is not None
     eng.stop()
     assert eng.tracks[0].tail_data is None
+
+
+# ----- count-in and track management ------------------------------------------------
+
+def impulses(length, at, value=1.0):
+    a = np.zeros((length, 2), np.float32)
+    for i in at:
+        a[i] = value
+    return a
+
+
+def test_count_in_plays_before_song_then_overlaps():
+    eng = make_engine(const_track("song", 0.1, frames=1000))  # SR=1000
+    eng.seek(0.5)
+    clicks = impulses(400, [0, 100, 200, 300, 350])  # starts 0.3 s before the playhead
+    eng.play_with_count_in(clicks, clicks_start=0.2)
+    assert eng.counting_in and eng.count_in_remaining == pytest.approx(0.3)
+    out = render(eng, 400, block=64)[:, 0]
+    # First 300 frames: only clicks, song not started.
+    assert out[0] == 1.0 and out[100] == 1.0 and out[200] == 1.0 and out[1:100].max() == 0
+    assert not eng.counting_in and eng.position == pytest.approx(0.6)
+    # Then the song, with the remaining clicks on top at the right song time.
+    assert out[300] == pytest.approx(1.0) and out[301] == pytest.approx(0.1, abs=0.02)
+    assert out[350] == pytest.approx(1.0)
+
+
+def test_count_in_after_playhead_waits():
+    eng = make_engine(const_track("song", 0.0, frames=1000))
+    eng.seek(0.0)
+    eng.play_with_count_in(impulses(100, [0, 50]), clicks_start=0.3)  # clicks begin later in the song
+    assert not eng.counting_in
+    out = render(eng, 400)[:, 0]
+    assert out[:300].max() == 0 and out[300] == 1.0 and out[350] == 1.0
+
+
+def test_count_in_cancelled_by_pause_seek_and_loop_wrap():
+    for action in ("pause", "seek", "stop"):
+        eng = make_engine(const_track("song", 0.0, frames=1000))
+        eng.seek(0.5)
+        eng.play_with_count_in(impulses(400, [0, 390]), clicks_start=0.2)
+        render(eng, 50)
+        {"pause": eng.pause, "seek": lambda: eng.seek(0.1), "stop": eng.stop}[action]()
+        assert not eng.counting_in and eng.count_in_remaining == 0
+        eng.play()
+        assert not render(eng, 500)[:, 0].any()  # no stray clicks afterwards
+
+    eng = make_engine(const_track("song", 0.0, frames=1000))
+    eng.set_loop(0.2, 0.4)
+    eng.seek(0.2)
+    eng.play_with_count_in(impulses(400, [399]), clicks_start=0.1)  # last click would land after the wrap
+    out = render(eng, 600)[:, 0]
+    assert not out[100:].any()
+
+
+def test_count_in_respects_loop_start():
+    eng = make_engine(const_track("song", 0.0, frames=1000))
+    eng.set_loop(0.6, 0.9)
+    eng.seek(0.1)  # outside the loop: play starts at 0.6
+    assert eng.start_position == pytest.approx(0.6)
+    eng.play_with_count_in(impulses(200, [0]), clicks_start=0.4)
+    assert eng.count_in_remaining == pytest.approx(0.2) and eng.position == pytest.approx(0.6)
+
+
+def test_add_replace_remove_track_while_playing():
+    eng = make_engine(const_track("a", 0.1, frames=1000))
+    eng.play()
+    render(eng, 100)
+    i = eng.add_track(Track("click", np.full((500, 2), 0.2, np.float32), kind="metronome"))
+    assert i == 1 and eng.tracks[1].data.shape == (1000, 2) and not eng.tracks[1].is_audio
+    out = render(eng, 100)[:, 0]
+    assert out[0] < 0.3 and out[-1] == pytest.approx(0.3)  # faded in
+    eng.set_track_data(1, np.full((2000, 2), 0.3, np.float32))
+    assert eng.tracks[1].data.shape == (1000, 2)
+    assert render(eng, 10)[-1, 0] == pytest.approx(0.4)
+    eng.remove_track(1)
+    assert len(eng.tracks) == 1 and render(eng, 10)[-1, 0] == pytest.approx(0.1)

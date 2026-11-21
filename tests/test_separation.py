@@ -94,6 +94,12 @@ def test_real_separation_in_subprocess(tmp_path):
     assert msgs[-1][0] == "done", msgs[-1]
     stems, sr = load_stems(tmp_path / "out")
     assert len(stems) == 6 and sr == SR
+    # A pure tone has no beat: detection may legitimately find none, but if
+    # beats.json exists it must be readable.
+    from backing_track_generator.beats import read_beats_file
+
+    if (tmp_path / "out" / "beats.json").exists():
+        assert read_beats_file(tmp_path / "out" / "beats.json") is not None
     mix = sum(s.data for s in stems)
     assert np.sqrt(((mix[:, 0] - 0.3 * np.sin(2 * np.pi * 110 * t)) ** 2).mean()) < 0.02
 

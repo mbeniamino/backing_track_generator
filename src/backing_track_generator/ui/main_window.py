@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
@@ -21,19 +24,39 @@ from PySide6.QtWidgets import (
 )
 
 from ..audio_io import AudioLoadError, load_audio
+from ..beats import (
+    BEATS_FILE,
+    BeatError,
+    BeatGrid,
+    Corrections,
+    corrections_from_dict,
+    corrections_to_dict,
+    count_in,
+    effective_grid,
+    metronome_audio,
+    read_beats_file,
+)
 from ..engine import AudioEngine, Track
 from .. import cache
 from ..cache import format_size
 from ..model_update import ModelUpdateInfo, check_for_update, download_latest
-from ..project import ProjectError, ProjectSettings, TrackSettings, is_project, load_project, save_project
+from ..project import (
+    ProjectError,
+    ProjectSettings,
+    TrackSettings,
+    is_project,
+    load_project,
+    save_project,
+    track_files,
+)
 from ..render import FILE_FILTERS, FORMATS, RenderError, render_mix
-from ..separation import DEFAULT_MODEL, SeparationError, cache_dir_for, is_cached, load_stems
+from ..separation import DEFAULT_MODEL, SeparationError, cache_dir_for, is_cached, load_stems, stem_files
 from ..timefmt import format_time
 from ..transpose import MAX_SEMITONES, MIN_SEMITONES, TranspositionCache
 from .background import BackgroundCall
 from .cache_dialog import CacheDialog
 from .settings import AppSettings
-from .separation_job import SeparationJob
+from .separation_job import BeatJob, SeparationJob
 from .timeline import TimeRuler, Timeline
 from . import theme
 from .track_lane import HEADER_OFFSET, TrackLane
@@ -42,6 +65,8 @@ from .transpose_job import TransposeJob
 AUDIO_FILTER = "Audio files (*.wav *.flac *.mp3 *.ogg *.m4a *.aac *.opus *.aiff *.aif);;All files (*)"
 UI_REFRESH_MS = 30
 TRANSPOSE_DEBOUNCE_MS = 350  # wait for the user to stop clicking before rendering
+METRONOME = "metronome"
+METRONOME_DEFAULT_GAIN = 0.7  # about -3 dB
 
 
 class SemitoneSpinBox(QSpinBox):
@@ -100,6 +125,15 @@ class MainWindow(QMainWindow):
         self._transpose_timer.setSingleShot(True)
         self._transpose_timer.setInterval(TRANSPOSE_DEBOUNCE_MS)
         self._transpose_timer.timeout.connect(self._apply_transpose)
+        # Beats: as detected, the user's corrections, and the resulting grid.
+        self._beats_detected: BeatGrid | None = None
+        self._beat_corrections = Corrections()
+        self._beat_grid: BeatGrid | None = None
+        self._beat_numbers = None
+        self._beats_job: BeatJob | None = None
+        self._beats_job_generation = -1
+        self._beats_tmp: Path | None = None  # detection output for projects (not in the cache)
+        self._metronome_settings: dict | None = None  # mute/solo/gain to apply when the track appears
 
         self._build_actions()
         self._build_ui()
@@ -132,6 +166,33 @@ class MainWindow(QMainWindow):
         self.act_loop.setShortcut(Qt.Key.Key_L)
         self.act_loop.setToolTip("Toggle looping (L). Drag on the ruler to set the loop region.")
         self.act_loop.toggled.connect(self.timeline.set_loop_enabled)
+
+        self.act_count_in = QAction(theme.icon("metronome", theme.TEXT), "&Count-in", self)
+        self.act_count_in.setCheckable(True)
+        self.act_count_in.setChecked(self.settings.count_in)
+        self.act_count_in.setShortcut(Qt.Key.Key_C)
+        self.act_count_in.setToolTip("Count-in (C): one bar of clicks before playback starts")
+        self.act_count_in.toggled.connect(self._on_count_in_toggled)
+
+        self.act_tempo_double = QAction("&Double tempo", self)
+        self.act_tempo_double.setShortcut("Ctrl+Shift+Up")
+        self.act_tempo_double.triggered.connect(lambda: self._correct_beats(tempo=+1))
+        self.act_tempo_halve = QAction("&Halve tempo", self)
+        self.act_tempo_halve.setShortcut("Ctrl+Shift+Down")
+        self.act_tempo_halve.triggered.connect(lambda: self._correct_beats(tempo=-1))
+        self.act_bar_earlier = QAction("Bar starts one beat &earlier", self)
+        self.act_bar_earlier.setShortcut("Ctrl+Shift+Left")
+        self.act_bar_earlier.triggered.connect(lambda: self._correct_beats(bar_offset=-1))
+        self.act_bar_later = QAction("Bar starts one beat &later", self)
+        self.act_bar_later.setShortcut("Ctrl+Shift+Right")
+        self.act_bar_later.triggered.connect(lambda: self._correct_beats(bar_offset=+1))
+        self.act_half_beat = QAction("Clicks on the &off-beat (shift by half a beat)", self)
+        self.act_half_beat.setCheckable(True)
+        self.act_half_beat.toggled.connect(lambda on: self._correct_beats(half_beat=on))
+        self.act_beats_reset = QAction("&Reset beat corrections", self)
+        self.act_beats_reset.triggered.connect(self._reset_beat_corrections)
+        self._beat_actions = [self.act_tempo_double, self.act_tempo_halve, self.act_bar_earlier,
+                              self.act_bar_later, self.act_half_beat, self.act_beats_reset]
 
         self.act_loop_in = QAction("Set loop &start at playhead", self)
         self.act_loop_in.setShortcut(Qt.Key.Key_BracketLeft)
@@ -217,10 +278,16 @@ class MainWindow(QMainWindow):
         transport_menu.addAction(self.act_loop_in)
         transport_menu.addAction(self.act_loop_out)
         transport_menu.addAction(self.act_loop_clear)
+        transport_menu.addAction(self.act_count_in)
         transport_menu.addSeparator()
         transport_menu.addAction(self.act_transpose_up)
         transport_menu.addAction(self.act_transpose_down)
         transport_menu.addAction(self.act_transpose_reset)
+        beats_menu = self.menuBar().addMenu("&Beats")
+        beats_menu.addAction(self.act_count_in)
+        beats_menu.addSeparator()
+        for a in self._beat_actions:
+            beats_menu.addAction(a)
 
     def _build_ui(self) -> None:
         tb = self.addToolBar("Transport")
@@ -233,6 +300,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_play)
         tb.addAction(self.act_stop)
         tb.addAction(self.act_loop)
+        tb.addAction(self.act_count_in)
         tb.addSeparator()
         self.time_label = QLabel()
         self.time_label.setObjectName("timeDisplay")
@@ -257,6 +325,10 @@ class MainWindow(QMainWindow):
             tb.addWidget(button)
             self._step_buttons.append(button)
         tb.addSeparator()
+        self.beat_label = QLabel()
+        self.beat_label.setObjectName("beatDisplay")
+        self.beat_label.setToolTip("Bar.beat and tempo at the playhead (from the detected beats)")
+        tb.addWidget(self.beat_label)
         self.loop_label = QLabel()
         self.loop_label.setObjectName("loopDisplay")
         tb.addWidget(self.loop_label)
@@ -350,6 +422,7 @@ class MainWindow(QMainWindow):
         stems), so keep position, play state, loop and transposition."""
         position, playing = self.engine.position, self.engine.is_playing
         loop, loop_on = self.timeline.loop, self.timeline.loop_enabled
+        self._clear_beats()
         self.engine.load(tracks, sample_rate)
         self._rebuild_lanes()  # resets the timeline, including the loop
         if keep_transport:
@@ -390,7 +463,7 @@ class MainWindow(QMainWindow):
         tl = self.timeline
         return ProjectSettings(
             sample_rate=self.engine.sample_rate,
-            tracks=[TrackSettings(t.name, t.mute, t.solo, t.gain) for t in self.engine.tracks],
+            tracks=[TrackSettings(t.name, t.mute, t.solo, t.gain) for t in self.engine.tracks if t.is_audio],
             source_name=self._source_name,
             source_path=str(self._source_path) if self._source_path is not None else None,
             separated=self._separated,
@@ -399,6 +472,9 @@ class MainWindow(QMainWindow):
             loop=tl.loop,
             loop_enabled=tl.loop is not None and tl.loop_enabled,
             position=self.engine.position,
+            beats=None if self._beats_detected is None else {
+                **self._beats_detected.to_dict(), "corrections": corrections_to_dict(self._beat_corrections)},
+            metronome=self._metronome_state(),
             extra=self._project_extra,
         )
 
@@ -598,6 +674,10 @@ class MainWindow(QMainWindow):
             self.engine.seek(settings.position)
             self.transpose_spin.setValue(settings.transpose)
             self._apply_transpose()  # no need to wait for the debounce
+            self._metronome_settings = settings.metronome
+            if settings.beats and settings.beats.get("beats"):
+                self._set_beats(BeatGrid.from_dict(settings.beats),
+                                corrections_from_dict(settings.beats.get("corrections")))
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -616,6 +696,11 @@ class MainWindow(QMainWindow):
         self._update_actions()
         self._refresh()
         self.statusBar().showMessage(f"Opened project {directory}", 5000)
+        if self._beats_detected is None:  # saved before beat detection existed
+            fd, tmp = tempfile.mkstemp(prefix="btg-beats-", suffix=".json")
+            os.close(fd)
+            paths, gains = track_files(directory)
+            self._start_beats_job(paths, gains, Path(tmp), temporary=True)
         return True
 
     # ----- transposition -------------------------------------------------
@@ -625,7 +710,7 @@ class MainWindow(QMainWindow):
         current transposition for the new tracks if it should be kept."""
         self._cancel_transpose_job()
         self._track_generation += 1
-        self._transpose_cache = TranspositionCache([(t.name, t.data) for t in self.engine.tracks])
+        self._transpose_cache = TranspositionCache([(t.name, t.data) for t in self.engine.tracks if t.is_audio])
         self._semitones = 0
         if not keep_value:
             self.transpose_spin.blockSignals(True)
@@ -650,7 +735,7 @@ class MainWindow(QMainWindow):
         datas = cache.get(target)
         if datas is not None:
             if target != self._semitones:
-                self.engine.swap_audio(datas)
+                self._swap_audio(datas)
                 self._semitones = target
             self._update_transpose_status()
             return
@@ -662,6 +747,12 @@ class MainWindow(QMainWindow):
         self._transpose_job = job
         job.start()
         self._on_transpose_progress(0.0)
+
+    def _swap_audio(self, datas: list) -> None:
+        """Swap in transposed audio for the song's tracks; generated tracks
+        (the metronome) keep theirs."""
+        it = iter(datas)
+        self.engine.swap_audio([next(it) if t.is_audio else t.data for t in self.engine.tracks])
 
     def _cancel_transpose_job(self) -> None:
         if self._transpose_job is not None:
@@ -687,7 +778,7 @@ class MainWindow(QMainWindow):
         self._transpose_job = None
         self._transpose_cache.put(semitones, datas)
         if semitones == self.transpose_spin.value():
-            self.engine.swap_audio(datas)
+            self._swap_audio(datas)
             self._semitones = semitones
         self._update_transpose_status()
         self._apply_transpose()  # in case the target moved on meanwhile
@@ -783,6 +874,12 @@ class MainWindow(QMainWindow):
         self._separated = True
         self._update_actions()
         self.statusBar().showMessage(f"Separated into {len(stems)} tracks", 5000)
+        grid = read_beats_file(stem_dir / BEATS_FILE)
+        if grid is not None:
+            self._set_beats(grid, Corrections())
+        else:  # separated before beat detection existed, or detection failed
+            paths, gains = stem_files(stem_dir)
+            self._start_beats_job(paths, gains, stem_dir / BEATS_FILE)
 
     def _rebuild_lanes(self) -> None:
         for lane in self._lanes:
@@ -796,17 +893,151 @@ class MainWindow(QMainWindow):
         self.timeline.set_duration(self.engine.duration)
         self.timeline.set_position(0.0)
         for i, track in enumerate(self.engine.tracks):
-            lane = TrackLane(self.timeline, track.name, track.data, theme.track_color(track.name, i))
-            lane.gainChanged.connect(lambda gain, i=i: self._on_gain(i, gain))
-            lane.muteToggled.connect(lambda mute, i=i: self._on_mute(i, mute))
-            lane.soloToggled.connect(lambda solo, exclusive, i=i: self._on_solo(i, solo, exclusive))
-            self.lanes_layout.addWidget(lane, 1)
-            self._lanes.append(lane)
+            self._lanes.append(self._make_lane(i, track))
         self._sync_lanes()
-        reference = max((lane.waveform.peak for lane in self._lanes), default=0.0)
-        for lane in self._lanes:
-            lane.waveform.set_reference_peak(reference)
+        self._update_reference_peaks()
         self._update_time_label()
+
+    def _make_lane(self, i: int, track: Track) -> TrackLane:
+        lane = TrackLane(self.timeline, track.name, track.data, theme.track_color(track.name, i))
+        lane.gainChanged.connect(lambda gain, i=i: self._on_gain(i, gain))
+        lane.muteToggled.connect(lambda mute, i=i: self._on_mute(i, mute))
+        lane.soloToggled.connect(lambda solo, exclusive, i=i: self._on_solo(i, solo, exclusive))
+        if track.is_audio:
+            self.lanes_layout.addWidget(lane, 1)
+        else:  # the metronome sits at the top
+            lane.setToolTip("Generated from the detected beats; corrections are in the Beats menu")
+            self.lanes_layout.insertWidget(0, lane, 1)
+        return lane
+
+    def _update_reference_peaks(self) -> None:
+        """Song tracks share one vertical scale; the metronome has its own."""
+        audio = [lane for lane, t in zip(self._lanes, self.engine.tracks) if t.is_audio]
+        reference = max((lane.waveform.peak for lane in audio), default=0.0)
+        for lane, track in zip(self._lanes, self.engine.tracks):
+            lane.waveform.set_reference_peak(reference if track.is_audio else lane.waveform.peak)
+
+    # ----- beats & metronome ---------------------------------------------------
+
+    def _clear_beats(self) -> None:
+        """A new track set: the old beats don't apply (the caller sets new ones)."""
+        self._cancel_beats_job()
+        self._beats_detected = None
+        self._beat_corrections = Corrections()
+        self._beat_grid = None
+        self._beat_numbers = None
+        self._metronome_settings = None
+        self.act_half_beat.blockSignals(True)
+        self.act_half_beat.setChecked(False)
+        self.act_half_beat.blockSignals(False)
+
+    def _start_beats_job(self, paths: list[str], gains: list[float], out_file: Path,
+                         temporary: bool = False) -> None:
+        """``temporary``: ``out_file`` is a temp file (project beats, deleted after reading)."""
+        self._cancel_beats_job()
+        if temporary:
+            self._beats_tmp = out_file
+        job = BeatJob(paths, gains, out_file, parent=self)
+        job.finished.connect(self._on_beats_finished)
+        job.failed.connect(self._on_beats_failed)
+        self._beats_job = job
+        self._beats_job_generation = self._track_generation
+        job.start()
+        self.statusBar().showMessage("Detecting beats…")
+
+    def _cancel_beats_job(self) -> None:
+        if self._beats_job is not None:
+            self._beats_job.cancel()
+            self._beats_job.deleteLater()
+            self._beats_job = None
+        if self._beats_tmp is not None:
+            self._beats_tmp.unlink(missing_ok=True)
+            self._beats_tmp = None
+
+    def _on_beats_finished(self, path: Path) -> None:
+        if self.sender() is not self._beats_job or self._beats_job_generation != self._track_generation:
+            return
+        self._beats_job.deleteLater()
+        self._beats_job = None
+        grid = read_beats_file(path)
+        from_project = self._beats_tmp is not None
+        if self._beats_tmp is not None:
+            self._beats_tmp.unlink(missing_ok=True)
+            self._beats_tmp = None
+        if grid is None:
+            self.statusBar().showMessage("Beat detection produced no result", 8000)
+            return
+        self._set_beats(grid, self._beat_corrections)
+        if from_project:
+            self._set_dirty(True)  # the project gains its beats on the next save
+        self.statusBar().showMessage(f"Beats detected: about {grid.tempo_at(self.engine.position):.0f} BPM", 6000)
+
+    def _on_beats_failed(self, message: str) -> None:
+        if self.sender() is not self._beats_job:
+            return
+        self._beats_job.deleteLater()
+        self._beats_job = None
+        if self._beats_tmp is not None:
+            self._beats_tmp.unlink(missing_ok=True)
+            self._beats_tmp = None
+        self.statusBar().showMessage(f"No metronome: {message}", 10000)
+
+    def _metronome_index(self) -> int | None:
+        return next((i for i, t in enumerate(self.engine.tracks) if t.kind == METRONOME), None)
+
+    def _metronome_state(self) -> dict | None:
+        idx = self._metronome_index()
+        if idx is None:
+            return self._metronome_settings
+        t = self.engine.tracks[idx]
+        return {"mute": t.mute, "solo": t.solo, "gain": t.gain}
+
+    def _set_beats(self, detected: BeatGrid, corrections: Corrections) -> None:
+        """Install a beat grid: (re)generate the metronome track and its lane."""
+        self._beats_detected = detected
+        self._beat_corrections = corrections
+        self.act_half_beat.blockSignals(True)
+        self.act_half_beat.setChecked(corrections.half_beat)
+        self.act_half_beat.blockSignals(False)
+        self._beat_grid = effective_grid(detected, corrections)
+        self._beat_numbers = self._beat_grid.beat_numbers()
+        frames = int(round(self.engine.duration * self.engine.sample_rate))
+        audio = metronome_audio(self._beat_grid, frames, self.engine.sample_rate)
+
+        idx = self._metronome_index()
+        if idx is None:
+            s = self._metronome_settings or {}
+            track = Track(METRONOME, audio, kind=METRONOME, mute=bool(s.get("mute", False)),
+                          solo=bool(s.get("solo", False)), gain=float(s.get("gain", METRONOME_DEFAULT_GAIN)))
+            idx = self.engine.add_track(track)
+            self._lanes.append(self._make_lane(idx, track))
+        else:
+            self.engine.set_track_data(idx, audio)
+            old = self._lanes[idx]
+            self.lanes_layout.removeWidget(old)
+            old.hide()
+            old.deleteLater()
+            self._lanes[idx] = self._make_lane(idx, self.engine.tracks[idx])
+        self._sync_lanes()
+        self._update_reference_peaks()
+        self._update_actions()
+        self._update_beat_label()
+
+    def _correct_beats(self, tempo: int = 0, bar_offset: int = 0, half_beat: bool | None = None) -> None:
+        if self._beats_detected is None:
+            return
+        c = self._beat_corrections
+        new = Corrections(tempo=max(-2, min(2, c.tempo + tempo)), bar_offset=c.bar_offset + bar_offset,
+                          half_beat=c.half_beat if half_beat is None else half_beat)
+        if new != c:
+            self._set_beats(self._beats_detected, new)
+            self._set_dirty(True)
+            self.statusBar().showMessage(f"Beats: {self._beat_grid.tempo_at(self.engine.position):.0f} BPM", 4000)
+
+    def _reset_beat_corrections(self) -> None:
+        if self._beats_detected is not None and not self._beat_corrections.is_identity():
+            self._set_beats(self._beats_detected, Corrections())
+            self._set_dirty(True)
 
     # ----- loop ----------------------------------------------------------
 
@@ -891,8 +1122,25 @@ class MainWindow(QMainWindow):
     # ----- transport -----------------------------------------------------
 
     def _on_play_pause(self) -> None:
-        self.engine.toggle()
+        if self.engine.is_playing or not self.act_count_in.isChecked() or self._beat_grid is None:
+            self.engine.toggle()
+        else:
+            self._play_with_count_in()
         self._refresh()
+
+    def _play_with_count_in(self) -> None:
+        try:
+            ci = count_in(self._beat_grid, self.engine.start_position, self.engine.sample_rate)
+        except BeatError:
+            self.engine.play()
+            return
+        idx = self._metronome_index()
+        gain = self.engine.tracks[idx].gain if idx is not None else METRONOME_DEFAULT_GAIN
+        # The count-in plays even if the metronome track is muted (that's the point).
+        self.engine.play_with_count_in(ci.audio * max(gain, 0.3), ci.start)
+
+    def _on_count_in_toggled(self, on: bool) -> None:
+        self.settings.count_in = on
 
     def _on_stop(self) -> None:
         self.engine.stop()
@@ -910,10 +1158,30 @@ class MainWindow(QMainWindow):
         self._update_time_label()
 
     def _update_time_label(self) -> None:
-        self.time_label.setText(
-            f"{format_time(self.engine.position)}"
-            f"<span style='color:{theme.TEXT_DIM.name()}; font-size:11pt; font-weight:400'>"
-            f" / {format_time(self.engine.duration)}</span>")
+        dim = f"<span style='color:{theme.TEXT_DIM.name()}; font-size:11pt; font-weight:400'>"
+        if self.engine.counting_in:
+            self.time_label.setText(
+                f"<span style='color:{theme.LOOP.name()}'>−{self.engine.count_in_remaining:.1f}</span>"
+                f"{dim} count-in</span>")
+        else:
+            self.time_label.setText(
+                f"{format_time(self.engine.position)}{dim} / {format_time(self.engine.duration)}</span>")
+        self._update_beat_label()
+
+    def _update_beat_label(self) -> None:
+        grid = self._beat_grid
+        if grid is None or len(grid) < 2:
+            self.beat_label.setText("")
+            return
+        pos = self.engine.position
+        i = int(np.searchsorted(grid.beats, pos + 0.02, side="right")) - 1
+        tempo = grid.tempo_at(pos)
+        if i < 0:
+            self.beat_label.setText(f"Bar –  ·  {tempo:.0f} BPM")
+            return
+        bar = int(np.searchsorted(grid.downbeats, grid.beats[i] + 1e-3, side="right"))
+        beat = int(self._beat_numbers[i])
+        self.beat_label.setText(f"Bar {max(bar, 1)}.{beat}  ·  {tempo:.0f} BPM")
 
     def _update_actions(self) -> None:
         loaded = self.engine.is_loaded
@@ -929,6 +1197,10 @@ class MainWindow(QMainWindow):
                   self.act_save, self.act_save_as, self.act_render, *self._step_buttons):
             w.setEnabled(loaded)
         self.act_render_loop.setEnabled(loaded and self.timeline.loop_valid)
+        has_beats = self._beats_detected is not None
+        self.act_count_in.setEnabled(has_beats)
+        for a in self._beat_actions:
+            a.setEnabled(has_beats)
 
     @property
     def semitones(self) -> int:
@@ -942,6 +1214,7 @@ class MainWindow(QMainWindow):
         if self._model_task is not None:
             self._model_task.wait(1)  # a network call; don't block closing for long
         self.cancel_separation()
+        self._cancel_beats_job()
         job = self._transpose_job
         self._cancel_transpose_job()
         if job is not None:
