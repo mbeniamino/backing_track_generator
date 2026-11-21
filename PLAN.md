@@ -50,7 +50,7 @@ app/
 ## Milestones
 1. ✅ Skeleton: open file, play/stop, click-to-seek, one waveform.
 2. ✅ Separation: Demucs in a background process with status-bar progress + cancel; stem cache in ~/.cache/backing-track-generator/stems (keyed by file hash + model).
-3. Multi-track lanes on a shared timeline + Mute/Solo.
+3. ✅ Multi-track lanes on a shared timeline + Mute/Solo (Ctrl+click = exclusive solo, 10 ms click-free gain ramps, inaudible lanes greyed).
 4. Loop A/B points.
 5. Transpose (±N semitones) with caching.
 6. Project save/load.

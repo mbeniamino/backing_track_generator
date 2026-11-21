@@ -161,3 +161,44 @@ def test_format_time():
     assert format_time(0) == "0:00.0"
     assert format_time(65.25) == "1:05.2"
     assert format_time(600, tenths=False) == "10:00"
+
+
+# ----- mute / solo in the engine ----------------------------------------------
+
+def test_mute_fades_out_without_click():
+    eng = make_engine(const_track("a", 0.5, frames=1000))  # SR=1000 -> 10-frame ramp
+    eng.play()
+    out = np.zeros((5, 2), np.float32)
+    eng.render_block(out)
+    eng.set_mute(0, True)
+    out = np.zeros((20, 2), np.float32)
+    eng.render_block(out)
+    left = out[:, 0]
+    assert left[0] < 0.5 and left[0] > 0.4       # starts just below full level
+    assert np.all(np.diff(left) <= 0)            # monotonic fade
+    assert not left[10:].any()                   # silent after 10 ms
+    eng.set_mute(0, False)
+    out = np.zeros((20, 2), np.float32)
+    eng.render_block(out)
+    assert out[0, 0] < 0.1 and out[-1, 0] == pytest.approx(0.5)
+
+
+def test_solo_and_exclusive_solo():
+    eng = make_engine(const_track("a", 0.1), const_track("b", 0.2), const_track("c", 0.4))
+    eng.set_solo(0, True)
+    eng.set_solo(1, True)
+    assert eng.audible_indices() == {0, 1}
+    eng.set_solo(2, True, exclusive=True)
+    assert eng.audible_indices() == {2}
+    eng.set_mute(0, True)
+    eng.reset_mute_solo()
+    assert eng.audible_indices() == {0, 1, 2}
+
+
+def test_soloed_mix_after_ramp():
+    eng = make_engine(const_track("a", 0.1, frames=200), const_track("b", 0.2, frames=200))
+    eng.set_solo(1, True)
+    eng.play()
+    out = np.zeros((50, 2), np.float32)
+    eng.render_block(out)
+    np.testing.assert_allclose(out[20:], 0.2, rtol=1e-5)  # only b once a has faded

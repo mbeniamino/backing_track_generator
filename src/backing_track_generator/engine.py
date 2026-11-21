@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import numpy as np
 
 CHANNELS = 2
+# Gain changes (mute/solo) fade over this long, to avoid clicks.
+GAIN_RAMP_SECONDS = 0.01
 
 
 @dataclass
@@ -17,6 +19,9 @@ class Track:
     mute: bool = False
     solo: bool = False
     gain: float = 1.0
+    # Gain currently applied by the mixer; ramps towards the target gain.
+    # Owned by the engine (audio thread).
+    level: float = 0.0
 
 
 def audible_tracks(tracks: list[Track]) -> list[Track]:
@@ -53,6 +58,9 @@ class AudioEngine:
             if t.data.shape[0] < length:
                 pad = np.zeros((length - t.data.shape[0], CHANNELS), np.float32)
                 t.data = np.concatenate([t.data, pad])
+        audible = audible_tracks(tracks)
+        for t in tracks:
+            t.level = t.gain if any(t is a for a in audible) else 0.0
         with self._lock:
             self._playing = False
             self._tracks = tracks
@@ -77,6 +85,30 @@ class AudioEngine:
     @property
     def is_loaded(self) -> bool:
         return self._length > 0
+
+    # ----- mute / solo ---------------------------------------------------
+
+    def set_mute(self, index: int, mute: bool) -> None:
+        with self._lock:
+            self._tracks[index].mute = mute
+
+    def set_solo(self, index: int, solo: bool, exclusive: bool = False) -> None:
+        """Set a track's solo; ``exclusive`` clears all other solos."""
+        with self._lock:
+            if exclusive:
+                for t in self._tracks:
+                    t.solo = False
+            self._tracks[index].solo = solo
+
+    def reset_mute_solo(self) -> None:
+        with self._lock:
+            for t in self._tracks:
+                t.mute = t.solo = False
+
+    def audible_indices(self) -> set[int]:
+        with self._lock:
+            audible = audible_tracks(self._tracks)
+            return {i for i, t in enumerate(self._tracks) if any(t is a for a in audible)}
 
     # ----- transport -----------------------------------------------------
 
@@ -128,12 +160,26 @@ class AudioEngine:
             start = self._pos
             end = min(start + out.shape[0], self._length)
             n = end - start
-            for t in audible_tracks(self._tracks):
-                seg = t.data[start:end]
-                if t.gain == 1.0:
-                    out[:n] += seg
+            audible = audible_tracks(self._tracks)
+            step = 1.0 / max(GAIN_RAMP_SECONDS * self._sample_rate, 1.0)
+            for t in self._tracks:
+                target = t.gain if any(t is a for a in audible) else 0.0
+                level = t.level
+                if level == target:
+                    if target == 0.0:
+                        continue
+                    seg = t.data[start:end]
+                    out[:n] += seg if target == 1.0 else seg * np.float32(target)
+                    continue
+                # Linear fade from the current level towards the target.
+                k = np.arange(1, n + 1, dtype=np.float32) * np.float32(step)
+                if target > level:
+                    ramp = np.minimum(level + k, target)
                 else:
-                    out[:n] += seg * t.gain
+                    ramp = np.maximum(level - k, target)
+                out[:n] += t.data[start:end] * ramp[:, None]
+                if n:
+                    t.level = float(ramp[-1])
             self._pos = end
             if end >= self._length:
                 self._playing = False

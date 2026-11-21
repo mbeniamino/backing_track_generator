@@ -80,6 +80,11 @@ class MainWindow(QMainWindow):
         self.act_separate.setToolTip("Split the song into instrument/voice tracks with Demucs")
         self.act_separate.triggered.connect(self.start_separation)
 
+        self.act_reset_ms = QAction("&Reset mute/solo", self)
+        self.act_reset_ms.setShortcut("Ctrl+R")
+        self.act_reset_ms.setEnabled(False)
+        self.act_reset_ms.triggered.connect(self.reset_mute_solo)
+
         self.act_quit = QAction("&Quit", self)
         self.act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         self.act_quit.triggered.connect(self.close)
@@ -90,6 +95,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_quit)
         tracks_menu = self.menuBar().addMenu("T&racks")
         tracks_menu.addAction(self.act_separate)
+        tracks_menu.addAction(self.act_reset_ms)
         transport_menu = self.menuBar().addMenu("&Transport")
         transport_menu.addAction(self.act_play)
         transport_menu.addAction(self.act_stop)
@@ -251,19 +257,46 @@ class MainWindow(QMainWindow):
 
     def _rebuild_lanes(self) -> None:
         for lane in self._lanes:
+            # Detach now: deleteLater() alone only acts once the event loop runs.
+            self.lanes_layout.removeWidget(lane)
+            lane.hide()
             lane.deleteLater()
         self._lanes.clear()
         self.placeholder.hide()
         self.timeline.set_duration(self.engine.duration)
         self.timeline.set_position(0.0)
-        for track in self.engine.tracks:
+        for i, track in enumerate(self.engine.tracks):
             lane = TrackLane(self.timeline, track.name, track.data)
+            lane.muteToggled.connect(lambda mute, i=i: self._on_mute(i, mute))
+            lane.soloToggled.connect(lambda solo, exclusive, i=i: self._on_solo(i, solo, exclusive))
             self.lanes_layout.addWidget(lane, 1)
             self._lanes.append(lane)
+        self._sync_lanes()
         reference = max((lane.waveform.peak for lane in self._lanes), default=0.0)
         for lane in self._lanes:
             lane.waveform.set_reference_peak(reference)
         self._update_time_label()
+
+    # ----- mute / solo ---------------------------------------------------
+
+    def _on_mute(self, index: int, mute: bool) -> None:
+        self.engine.set_mute(index, mute)
+        self._sync_lanes()
+
+    def _on_solo(self, index: int, solo: bool, exclusive: bool) -> None:
+        self.engine.set_solo(index, solo, exclusive)
+        self._sync_lanes()
+
+    def reset_mute_solo(self) -> None:
+        self.engine.reset_mute_solo()
+        self._sync_lanes()
+
+    def _sync_lanes(self) -> None:
+        """Make every lane's buttons and greying match the engine."""
+        audible = self.engine.audible_indices()
+        for i, (lane, track) in enumerate(zip(self._lanes, self.engine.tracks)):
+            lane.set_state(track.mute, track.solo, i in audible)
+        self.act_reset_ms.setEnabled(any(t.mute or t.solo for t in self.engine.tracks))
 
     # ----- drag & drop ---------------------------------------------------
 

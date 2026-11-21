@@ -79,6 +79,10 @@ def test_open_uses_cached_stems_and_keeps_position(qapp, tmp_path):
     assert win._job is None
     assert [t.name for t in win.engine.tracks] == ["vocals", "drums"]
     assert len(win._lanes) == 2
+    # The original's lane is gone from the layout, not just scheduled for deletion.
+    from backing_track_generator.ui.track_lane import TrackLane
+    visible = [w for w in win.findChildren(TrackLane) if w.isVisible()]
+    assert sorted(visible, key=id) == sorted(win._lanes, key=id)
     assert win.engine.position == pytest.approx(1.5, abs=0.01) and win.engine.is_playing
     assert not win.act_separate.isEnabled()
     win.close()
@@ -95,4 +99,39 @@ def test_lanes_share_vertical_scale(qapp, tmp_path):
     win.open_file(path)
     refs = [lane.waveform._reference_peak for lane in win._lanes]
     assert refs == [pytest.approx(0.5, abs=1e-3)] * 2
+    win.close()
+
+
+def test_mute_solo_buttons(qapp, tmp_path):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    path = make_song(tmp_path)
+    frames = 88200
+    write_stems(cache_dir_for(path), [
+        Stem(name, np.full((frames, 2), 0.1, np.float32)) for name in ("vocals", "bass", "drums")
+    ], 44100, source=path.name, model="htdemucs_6s")
+    win = make_window()
+    win.open_file(path)
+    vocals, bass, drums = win._lanes
+    active = lambda: [lane.waveform.active for lane in win._lanes]  # noqa: E731
+
+    assert active() == [True, True, True] and not win.act_reset_ms.isEnabled()
+
+    QTest.mouseClick(vocals.mute_button, Qt.MouseButton.LeftButton)
+    assert win.engine.tracks[0].mute and active() == [False, True, True]
+
+    QTest.mouseClick(bass.solo_button, Qt.MouseButton.LeftButton)
+    QTest.mouseClick(drums.solo_button, Qt.MouseButton.LeftButton)
+    assert win.engine.audible_indices() == {1, 2} and active() == [False, True, True]
+
+    # Ctrl+click: exclusive solo clears the other solos (and their buttons).
+    QTest.mouseClick(vocals.solo_button, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ControlModifier)
+    assert win.engine.audible_indices() == {0} and active() == [True, False, False]
+    assert not bass.solo_button.isChecked() and not drums.solo_button.isChecked()
+    assert vocals.mute_button.isChecked()  # solo overrides mute but keeps it set
+
+    win.act_reset_ms.trigger()
+    assert active() == [True, True, True]
+    assert not any(b.isChecked() for lane in win._lanes for b in (lane.mute_button, lane.solo_button))
     win.close()
