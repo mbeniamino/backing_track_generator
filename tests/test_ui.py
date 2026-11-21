@@ -944,9 +944,11 @@ def test_metronome_track_from_cached_beats(qapp, tmp_path):
     assert win.beat_label.text() == "Bar 1.2  ·  120 BPM"
     # The metronome has its own vertical scale.
     assert win._lanes[2].waveform._reference_peak == pytest.approx(win._lanes[2].waveform.peak)
-    # Mute / volume work like any track.
+    # Muted by default; mute / volume work like any track.
+    assert win.engine.tracks[2].mute and win._lanes[2].mute_button.isChecked()
+    assert not win._lanes[2].waveform.active
     win._lanes[2].mute_button.click()
-    assert win.engine.tracks[2].mute
+    assert not win.engine.tracks[2].mute
     win.close()
 
 
@@ -984,7 +986,7 @@ def test_beat_corrections_regenerate_metronome(qapp, tmp_path):
 def test_count_in_before_playback(qapp, tmp_path):
     win = make_window()
     win.open_file(beats_song(tmp_path))
-    win._lanes[2].mute_button.click()  # count-in plays even with the metronome muted
+    assert win.engine.tracks[2].mute  # count-in plays even with the metronome muted (the default)
     win.act_count_in.setChecked(True)
     win.engine.seek(0.0)
     win.act_play.trigger()
@@ -1087,6 +1089,7 @@ def test_render_includes_audible_metronome(qapp, tmp_path):
 
     win = make_window()
     win.open_file(beats_song(tmp_path))
+    win._lanes[2].mute_button.click()  # unmute (muted by default)
     with_click = win.render_to_file(path=tmp_path / "a.wav")
     assert "metronome" in win.statusBar().currentMessage()
     win._lanes[2].mute_button.click()
@@ -1095,3 +1098,17 @@ def test_render_includes_audible_metronome(qapp, tmp_path):
     b, _ = load_audio(without)
     assert np.abs(a - b).max() > 0.1
     win.close()
+
+
+def test_project_keeps_unmuted_metronome(qapp, tmp_path, dialogs):
+    win = make_window()
+    win.open_file(beats_song(tmp_path))
+    assert win.engine.tracks[2].mute
+    win._lanes[2].mute_button.click()
+    dialogs["save_path"] = tmp_path / "p"
+    win.save_project_as()
+    win.close()
+    win2 = make_window()
+    win2.open_project(tmp_path / "p")
+    assert not win2.engine.tracks[2].mute  # the saved state wins over the default
+    win2.close()

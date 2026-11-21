@@ -1007,7 +1007,8 @@ class MainWindow(QMainWindow):
         idx = self._metronome_index()
         if idx is None:
             s = self._metronome_settings or {}
-            track = Track(METRONOME, audio, kind=METRONOME, mute=bool(s.get("mute", False)),
+            # Muted by default for a newly opened song; projects keep their saved state.
+            track = Track(METRONOME, audio, kind=METRONOME, mute=bool(s.get("mute", True)),
                           solo=bool(s.get("solo", False)), gain=float(s.get("gain", METRONOME_DEFAULT_GAIN)))
             idx = self.engine.add_track(track)
             self._lanes.append(self._make_lane(idx, track))

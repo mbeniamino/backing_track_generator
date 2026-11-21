@@ -46,7 +46,7 @@ uv run backing-track-generator my-project/     # open a saved project
 | Set a loop | drag on the ruler; drag its edges to adjust; `[` / `]` set start / end at the playhead (if the playhead is outside the new loop, it jumps to the loop start) |
 | Toggle the loop | L |
 | Transpose | toolbar − / + buttons, `+` / `-` keys, `0` to reset |
-| Metronome | the top track (mute / solo / volume like the others); accented on beat 1 |
+| Metronome | the top track, muted when a song is opened: unmute it to hear the click (mute / solo / volume like the others); accented on beat 1 |
 | Count-in | metronome button in the toolbar or C: one bar of clicks before playback starts, at the tempo where you start |
 | Fix the beats | Beats menu: double / halve tempo (Ctrl+Shift+↑/↓), bar start one beat earlier / later (Ctrl+Shift+←/→), clicks on the off-beat, reset |
 | Save project | Ctrl+S / Ctrl+Shift+S |
