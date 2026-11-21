@@ -14,6 +14,11 @@ GAIN_RAMP_SECONDS = 0.01
 CROSSFADE_SECONDS = 0.01
 # Shorter loops are ignored.
 MIN_LOOP_SECONDS = 0.1
+# Output stream buffering. Large-ish blocks (~23 ms, ~46 ms total latency) give
+# the Python callback plenty of headroom when other apps load the CPU or the
+# audio server reconfigures; responsiveness of mute/seek is unaffected in practice.
+STREAM_BLOCKSIZE = 1024
+STREAM_LATENCY_SECONDS = 0.05
 
 
 @dataclass
@@ -278,7 +283,8 @@ class AudioEngine:
             samplerate=self._sample_rate,
             channels=CHANNELS,
             dtype="float32",
-            latency="low",
+            blocksize=STREAM_BLOCKSIZE,
+            latency=STREAM_LATENCY_SECONDS,
             callback=self._callback,
         )
         self._stream.start()
