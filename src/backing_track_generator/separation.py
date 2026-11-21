@@ -84,6 +84,10 @@ def write_stems(stem_dir: Path, stems: list[Stem], sample_rate: int, source: str
 def load_stems(stem_dir: Path) -> tuple[list[Stem], int]:
     """Load cached stems, sorted in display order."""
     manifest = json.loads((stem_dir / MANIFEST).read_text())
+    try:
+        os.utime(stem_dir / MANIFEST)  # record "last used" for cache management
+    except OSError:
+        pass
     stems = []
     sr = manifest["sample_rate"]
     for entry in manifest["stems"]:

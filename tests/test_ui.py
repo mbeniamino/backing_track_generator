@@ -716,3 +716,97 @@ def test_check_model_updates_flow(qapp, monkeypatch):
     wait_until(qapp, lambda: downloads and len(shown) == 2 and win._model_task is None, timeout=5)
     assert downloads == ["htdemucs_6s"] and "updated (revision cccccccc)" in shown[1][1]
     win.close()
+
+
+# ----- cache dialog --------------------------------------------------------------
+
+def test_cache_dialog(qapp, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from backing_track_generator import cache
+    from backing_track_generator.ui.cache_dialog import CacheDialog
+
+    monkeypatch.setattr(cache, "model_cache_info",
+                        lambda model: cache.ModelCacheInfo("adefossez/HTDemucs-6s", "a" * 40, 55_000_000, [], 0))
+    dirs = []
+    for name in ("one.mp3", "two.mp3", "three.mp3"):
+        src = tmp_path / name
+        src.write_bytes(name.encode())
+        d = cache_dir_for(src)
+        write_stems(d, [Stem("bass", np.zeros((1000, 2), np.float32))], 44100, source=name, model="htdemucs_6s")
+        dirs.append(d)
+    leftover = dirs[0].parent / ".tmp-crash-1"
+    leftover.mkdir()
+
+    answers = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: answers.pop(0))
+
+    # While a separation runs, its temp folder must not be offered for deletion.
+    busy = CacheDialog(separation_running=True)
+    assert busy.leftovers == [] and "left over" not in busy.summary.text()
+    busy.close()
+
+    dlg = CacheDialog(current_dir=dirs[1])
+    assert dlg.tree.topLevelItemCount() == 3 and "3 songs" in dlg.summary.text()
+    assert "left over" in dlg.summary.text()
+    names = [dlg.tree.topLevelItem(i).text(0) for i in range(3)]
+    assert any(n == "two.mp3   (open now)" for n in names)
+    assert "current version aaaaaaaa" in dlg.model_label.text() and not dlg.remove_old_models.isEnabled()
+    assert not dlg.delete_selected.isEnabled()
+
+    target = next(i for i in range(3) if dlg.tree.topLevelItem(i).text(0).startswith("one"))
+    dlg.tree.topLevelItem(target).setSelected(True)
+    answers.append(QMessageBox.StandardButton.No)
+    dlg.delete_selected.click()
+    assert dirs[0].exists()
+    dlg.tree.topLevelItem(target).setSelected(True)
+    answers.append(QMessageBox.StandardButton.Yes)
+    dlg.delete_selected.click()
+    assert not dirs[0].exists() and dlg.tree.topLevelItemCount() == 2 and dlg.freed > 0
+
+    answers.append(QMessageBox.StandardButton.Yes)
+    dlg.delete_all.click()
+    assert not any(d.exists() for d in dirs) and not leftover.exists()
+    assert dlg.tree.topLevelItemCount() == 0 and not dlg.delete_all.isEnabled()
+    dlg.close()
+
+
+def test_manage_cache_action_reports_freed_space(qapp, tmp_path, monkeypatch):
+    from backing_track_generator.ui import main_window
+
+    class FakeDialog:
+        def __init__(self, parent, current_dir, separation_running):
+            FakeDialog.args = (current_dir, separation_running)
+            self.freed = 3 * 1024 ** 2
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(main_window, "CacheDialog", FakeDialog)
+    win, path = stems_window(tmp_path)
+    win.act_manage_cache.trigger()
+    assert FakeDialog.args == (cache_dir_for(path), False)
+    assert "Freed 3.0 MB" in win.statusBar().currentMessage()
+    win.close()
+
+
+def test_cache_dialog_enter_never_deletes(qapp, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QMessageBox
+
+    from backing_track_generator import cache
+    from backing_track_generator.ui.cache_dialog import CacheDialog
+
+    monkeypatch.setattr(cache, "model_cache_info",
+                        lambda model: cache.ModelCacheInfo("r", None, 0, [], 0))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    src = tmp_path / "x.mp3"
+    src.write_bytes(b"x")
+    d = cache_dir_for(src)
+    write_stems(d, [Stem("bass", np.zeros((10, 2), np.float32))], 44100, source="x.mp3", model="m")
+    dlg = CacheDialog()
+    dlg.show()
+    dlg.tree.topLevelItem(0).setSelected(True)
+    QTest.keyClick(dlg, Qt.Key.Key_Return)
+    assert d.exists() and not dlg.isVisible()  # Enter closed the dialog, deleted nothing

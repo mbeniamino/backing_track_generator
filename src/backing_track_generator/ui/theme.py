@@ -96,6 +96,7 @@ QPushButton {{ background: {RAISED.name()}; border: 1px solid {BORDER.name()}; b
                padding: 5px 14px; }}
 QPushButton:hover {{ border-color: {ACCENT.name()}; }}
 QPushButton:default {{ border-color: {ACCENT.name()}; }}
+QPushButton:disabled {{ color: {TEXT_DIM.darker(140).name()}; background: {PANEL.name()}; border-color: {PANEL.name()}; }}
 """
 
 

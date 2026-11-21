@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from ..audio_io import AudioLoadError, load_audio
 from ..engine import AudioEngine, Track
+from ..cache import format_size
 from ..model_update import ModelUpdateInfo, check_for_update, download_latest
 from ..project import ProjectError, ProjectSettings, TrackSettings, is_project, load_project, save_project
 from ..render import FILE_FILTERS, FORMATS, RenderError, render_mix
@@ -29,6 +30,7 @@ from ..separation import DEFAULT_MODEL, SeparationError, cache_dir_for, is_cache
 from ..timefmt import format_time
 from ..transpose import MAX_SEMITONES, MIN_SEMITONES, TranspositionCache
 from .background import BackgroundCall
+from .cache_dialog import CacheDialog
 from .separation_job import SeparationJob
 from .timeline import TimeRuler, Timeline
 from . import theme
@@ -179,6 +181,10 @@ class MainWindow(QMainWindow):
         self.act_check_model.setToolTip("Check Hugging Face for a newer version of the Demucs model")
         self.act_check_model.triggered.connect(self.check_model_updates)
 
+        self.act_manage_cache = QAction("&Manage cache…", self)
+        self.act_manage_cache.setToolTip("See and delete cached separations and old model versions")
+        self.act_manage_cache.triggered.connect(self.manage_cache)
+
         self.act_quit = QAction("&Quit", self)
         self.act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         self.act_quit.triggered.connect(self.close)
@@ -199,6 +205,7 @@ class MainWindow(QMainWindow):
         tracks_menu.addAction(self.act_reset_ms)
         tracks_menu.addSeparator()
         tracks_menu.addAction(self.act_check_model)
+        tracks_menu.addAction(self.act_manage_cache)
         transport_menu = self.menuBar().addMenu("&Transport")
         transport_menu.addAction(self.act_play)
         transport_menu.addAction(self.act_stop)
@@ -488,6 +495,17 @@ class MainWindow(QMainWindow):
             ext = selected[selected.find("*") + 1: selected.find(")")] if "*" in selected else ".wav"
             path = path.with_name(path.name + ext)
         return path
+
+    # ----- cache -------------------------------------------------------------
+
+    def manage_cache(self) -> None:
+        current = None
+        if self._separated and self._source_path is not None and self._source_path.is_file():
+            current = cache_dir_for(self._source_path)
+        dialog = CacheDialog(self, current_dir=current, separation_running=self._job is not None)
+        dialog.exec()
+        if dialog.freed:
+            self.statusBar().showMessage(f"Freed {format_size(dialog.freed)} of cache", 8000)
 
     # ----- model updates -----------------------------------------------------
 

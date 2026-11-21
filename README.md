@@ -56,8 +56,11 @@ mix would clip, it is lowered as a whole instead (the status bar says by how muc
 - **Projects** are folders: `project.json` (settings) plus `tracks/*.flac`
   (24-bit, original pitch; usable on their own).
 - **Separated stems** are cached in `~/.cache/backing-track-generator/stems/`
-  (about 100–150 MB per song), so reopening a song is instant. Delete the folder
-  to reclaim space.
+  (about 100–150 MB per song), so reopening a song is instant. Tracks → Manage
+  cache lists them (size, last used) and deletes the ones you no longer need.
+- **The separation model** lives in the Hugging Face cache (`~/.cache/huggingface/`).
+  Tracks → Check for separation model updates downloads a newer version on request;
+  Manage cache removes the older versions.
 
 ## Development
 
