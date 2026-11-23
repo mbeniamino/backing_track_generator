@@ -86,3 +86,7 @@ RUN_SLOW=1 uv run pytest      # also runs Demucs end to end
 ```
 
 See `PLAN.md` for the design and milestones.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
