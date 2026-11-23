@@ -131,7 +131,7 @@ def apply_theme(app: QApplication) -> None:
 # ----- icons ---------------------------------------------------------------------
 
 def icon(kind: str, color: QColor = TEXT, size: int = 48) -> QIcon:
-    """Simple vector icons drawn in code: play, pause, stop, loop, open, save, split."""
+    """Simple vector icons drawn in code: play, pause, stop, start, loop, open, save, split."""
     ic = QIcon()
     for mode, c in ((QIcon.Mode.Normal, color), (QIcon.Mode.Disabled, QColor(TEXT_DIM.darker(150)))):
         pm = QPixmap(size, size)
@@ -164,6 +164,15 @@ def _draw_icon(p: QPainter, kind: str, c: QColor) -> None:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(c)
         p.drawRoundedRect(QRectF(6, 6, 12, 12), 2, 2)
+    elif kind == "start":  # go to beginning: a bar and a left-pointing triangle
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawRoundedRect(QRectF(5, 6, 2.6, 12), 1, 1)
+        path = QPainterPath(QPointF(19, 6))
+        path.lineTo(9, 12)
+        path.lineTo(19, 18)
+        path.closeSubpath()
+        p.drawPath(path)
     elif kind == "loop":
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)

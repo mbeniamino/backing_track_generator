@@ -272,7 +272,12 @@ def count_in(grid: BeatGrid, position: float, sample_rate: int, bars: int = 1) -
     """``bars`` bar(s) of clicks leading into the first beat at or after
     ``position``, at the local tempo there, counted so that the song's beat
     lands on its own number: entering on beat 1 -> "1 2 3 4", entering on
-    beat 3 of 4 -> "3 4 1 2". Clicks at or after ``position`` overlap the song."""
+    beat 3 of 4 -> "3 4 1 2". Clicks at or after ``position`` overlap the song.
+
+    If that first beat is so far ahead (an intro before the beat comes in)
+    that the whole count-in would fall inside the song, the count-in instead
+    leads into ``position`` itself ("1 2 3 4" at the song's first tempo), so
+    it always plays before the song starts."""
     if len(grid) < 2:
         raise BeatError("No beats")
     i = int(min(np.searchsorted(grid.beats, position - 0.02), len(grid.beats) - 1))
@@ -281,6 +286,8 @@ def count_in(grid: BeatGrid, position: float, sample_rate: int, bars: int = 1) -
     per_bar = grid.beats_per_bar_at(target)
     n = per_bar * bars
     number = int(grid.beat_numbers()[i])
+    if target - ibi * n > position:
+        target, number = position, 1
     numbers = (number - 1 - n + np.arange(n)) % per_bar + 1
     times = target - ibi * np.arange(n, 0, -1)
     length = int(round((target - times[0]) * sample_rate))

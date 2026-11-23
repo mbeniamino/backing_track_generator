@@ -139,6 +139,16 @@ def test_count_in_mid_bar_counts_to_the_right_beat():
     assert np.argmax(peaks) == 2
 
 
+def test_count_in_before_a_late_first_beat_leads_into_the_start():
+    g = steady(bpm=120, n=16, start=5.0)  # 5 s intro before the beat comes in
+    ci = count_in(g, 0.0, SR)
+    assert ci.start == pytest.approx(-2.0) and ci.beats == 4  # ends at the start position, not inside the song
+    onsets = [int(round(k * 0.5 * SR)) for k in range(4)]
+    peaks = [np.abs(ci.audio[o:o + 200, 0]).max() for o in onsets]
+    assert np.argmax(peaks) == 0
+    assert count_in(g, 3.5, SR).start == pytest.approx(3.0)  # within a bar of the beat: unchanged
+
+
 def test_count_in_in_three_four_and_errors():
     g = steady(bpm=90, n=12, per_bar=3)
     assert count_in(g, 0.0, SR).beats == 3

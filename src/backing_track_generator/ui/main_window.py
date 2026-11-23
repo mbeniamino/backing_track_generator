@@ -161,6 +161,11 @@ class MainWindow(QMainWindow):
         self.act_stop.setShortcut(Qt.Key.Key_Home)
         self.act_stop.triggered.connect(self._on_stop)
 
+        self.act_to_start = QAction(theme.icon("start"), "Go to &beginning", self)
+        self.act_to_start.setShortcut("Ctrl+Home")
+        self.act_to_start.setToolTip("Go to the beginning of the song (Ctrl+Home)")
+        self.act_to_start.triggered.connect(self._on_to_start)
+
         self.act_loop = QAction(theme.icon("loop", theme.LOOP), "&Loop", self)
         self.act_loop.setCheckable(True)
         self.act_loop.setShortcut(Qt.Key.Key_L)
@@ -273,6 +278,7 @@ class MainWindow(QMainWindow):
         transport_menu = self.menuBar().addMenu("&Transport")
         transport_menu.addAction(self.act_play)
         transport_menu.addAction(self.act_stop)
+        transport_menu.addAction(self.act_to_start)
         transport_menu.addSeparator()
         transport_menu.addAction(self.act_loop)
         transport_menu.addAction(self.act_loop_in)
@@ -297,6 +303,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act_save)
         tb.addAction(self.act_separate)
         tb.addSeparator()
+        tb.addAction(self.act_to_start)
         tb.addAction(self.act_play)
         tb.addAction(self.act_stop)
         tb.addAction(self.act_loop)
@@ -1147,6 +1154,11 @@ class MainWindow(QMainWindow):
         self.engine.stop()
         self._refresh()
 
+    def _on_to_start(self) -> None:
+        """Move the playhead to 0 (keeps playing if playing; Play from there counts in)."""
+        self.engine.seek(0.0)
+        self._refresh()
+
     def _on_seek(self, seconds: float) -> None:
         self.engine.seek(seconds)
         self._refresh()
@@ -1188,6 +1200,7 @@ class MainWindow(QMainWindow):
         loaded = self.engine.is_loaded
         self.act_play.setEnabled(loaded)
         self.act_stop.setEnabled(loaded)
+        self.act_to_start.setEnabled(loaded)
         self.act_loop.setEnabled(self.timeline.loop_valid)
         self.act_loop_in.setEnabled(loaded)
         self.act_loop_out.setEnabled(loaded)

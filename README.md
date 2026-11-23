@@ -40,6 +40,7 @@ uv run backing-track-generator my-project/     # open a saved project
 | Open a song / project | Ctrl+O / Ctrl+Shift+O, or drop it on the window |
 | Separate into tracks | automatic on open; Tracks → Separate (Ctrl+E) if cancelled |
 | Play / pause, stop | Space, Home (Stop returns to the loop start while looping) |
+| Go to the beginning | Ctrl+Home (Play from there counts in when Count-in is on) |
 | Jump | click on a waveform or the ruler (drag on a waveform to scrub) |
 | Mute / solo a track | M / S buttons; Ctrl+click S solos only that track; Ctrl+R resets |
 | Track volume | slider in the track header (−∞ to +6 dB); double-click resets to 0 dB |

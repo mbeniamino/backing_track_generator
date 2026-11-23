@@ -983,6 +983,21 @@ def test_beat_corrections_regenerate_metronome(qapp, tmp_path):
     win.close()
 
 
+def test_go_to_beginning_then_play_counts_in(qapp, tmp_path):
+    win = make_window()
+    assert not win.act_to_start.isEnabled()
+    win.open_file(beats_song(tmp_path))
+    assert win.act_to_start.isEnabled()
+    win.act_count_in.setChecked(True)
+    win.engine.seek(2.0)
+    win.act_to_start.trigger()
+    assert win.engine.position == 0.0 and not win.engine.is_playing
+    win.act_play.trigger()
+    assert win.engine.counting_in and win.engine.count_in_remaining == pytest.approx(1.75, abs=0.01)
+    win.engine.pause()
+    win.close()
+
+
 def test_count_in_before_playback(qapp, tmp_path):
     win = make_window()
     win.open_file(beats_song(tmp_path))
