@@ -3,7 +3,7 @@ name = "backing-track-generator"
 version = "0.1.0"
 description = "Split a song into tracks, then mute, loop, transpose and render backing tracks"
 authors = [
-    { name = "Matteo Beniamino", email = "beniamino@tautologica.org" }
+    { name = "Matteo Beniamino", email = "beniamino@beniamino.eu" }
 ]
 license = "MIT"
 license-files = ["LICENSE"]
