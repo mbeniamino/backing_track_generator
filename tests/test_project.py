@@ -20,7 +20,7 @@ def settings(**kw):
         sample_rate=SR,
         tracks=[TrackSettings("vocals", mute=True), TrackSettings("drums", solo=True), TrackSettings("other/stuff")],
         source_name="song.mp3", source_path="/music/song.mp3", separated=True, model="htdemucs_6s",
-        transpose=-3, loop=(1.5, 4.25), loop_enabled=True, position=2.0,
+        transpose=-3, speed=85, loop=(1.5, 4.25), loop_enabled=True, position=2.0,
         beats={"beats": [0.5, 1.0, 1.5], "downbeats": [0.5], "corrections": {"tempo": 1, "half_beat": False,
                                                                              "bar_offset": 0}},
         metronome={"mute": True, "solo": False, "gain": 0.5},
@@ -129,3 +129,15 @@ def test_not_json(tmp_path):
         load_project(tmp_path)
     with pytest.raises(ProjectError, match="No project"):
         load_project(tmp_path / "nothing")
+
+
+def test_speed_defaults_to_100_for_old_projects(tmp_path):
+    import json
+
+    d = tmp_path / "proj"
+    save_project(d, settings(), datas())
+    doc = json.loads((d / "project.json").read_text())
+    assert doc["speed"] == 85
+    del doc["speed"]
+    (d / "project.json").write_text(json.dumps(doc))
+    assert load_project(d)[0].speed == 100

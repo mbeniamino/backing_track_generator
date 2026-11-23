@@ -1,13 +1,14 @@
 # Backing Track Generator
 
 A desktop app that turns a song into a backing track: it splits the audio into
-instrument/voice tracks, lets you mute, solo, loop and transpose them, and
+instrument/voice tracks, lets you mute, solo, loop, transpose them and change their speed, and
 saves the result as a project or renders it to a single audio file.
 
 - **Separation** with [Demucs](https://github.com/facebookresearch/demucs)
   (`htdemucs_6s`: vocals, guitar, piano, bass, drums, other), running locally
   on the CPU. The model is downloaded on first use.
-- **Transposition** by ±12 semitones without changing tempo, with
+- **Transposition** by ±12 semitones without changing tempo, and **speed**
+  from 50 % to 150 % without changing pitch, with
   [Rubber Band](https://breakfastquay.com/rubberband/) (formant-preserving for vocals).
 - **Metronome and count-in** from beats detected with
   [beat_this](https://github.com/CPJKU/beat_this): the clicks follow the song's
@@ -17,7 +18,7 @@ saves the result as a project or renders it to a single audio file.
 
 - [uv](https://docs.astral.sh/uv/) (installs Python 3.12 and the Python dependencies)
 - System programs/libraries:
-  - `rubberband` command-line tool, for transposition
+  - `rubberband` command-line tool, for transposition and speed changes
   - `ffmpeg`, to open formats libsndfile can't read (m4a, aac, …)
   - PortAudio, for playback (usually already present)
 
@@ -47,6 +48,7 @@ uv run backing-track-generator my-project/     # open a saved project
 | Set a loop | drag on the ruler; drag its edges to adjust; `[` / `]` set start / end at the playhead (if the playhead is outside the new loop, it jumps to the loop start) |
 | Toggle the loop | L |
 | Transpose | toolbar − / + buttons, `+` / `-` keys, `0` to reset |
+| Speed (tempo) | toolbar − / + buttons in 5 % steps, `.` / `,` keys, Ctrl+0 to reset; the ruler, loop and beats stay in song time, and the metronome and count-in follow the new tempo |
 | Metronome | the top track, muted when a song is opened: unmute it to hear the click (mute / solo / volume like the others); accented on beat 1 |
 | Count-in | metronome button in the toolbar or C: one bar of clicks before playback starts, at the tempo where you start |
 | Fix the beats | Beats menu: double / halve tempo (Ctrl+Shift+↑/↓), bar start one beat earlier / later (Ctrl+Shift+←/→), clicks on the off-beat, reset |
@@ -55,7 +57,7 @@ uv run backing-track-generator my-project/     # open a saved project
 
 While looping, Play always starts inside the loop.
 
-Rendering contains exactly what you hear (mute/solo, volume and transposition). If the
+Rendering contains exactly what you hear (mute/solo, volume, transposition and speed). If the
 mix would clip, it is lowered as a whole instead (the status bar says by how much).
 
 ## Files

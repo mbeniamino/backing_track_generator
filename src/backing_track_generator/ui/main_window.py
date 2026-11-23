@@ -52,7 +52,15 @@ from ..project import (
 from ..render import FILE_FILTERS, FORMATS, RenderError, render_mix
 from ..separation import DEFAULT_MODEL, SeparationError, cache_dir_for, is_cached, load_stems, stem_files
 from ..timefmt import format_time
-from ..transpose import MAX_SEMITONES, MIN_SEMITONES, TranspositionCache
+from ..transpose import (
+    MAX_SEMITONES,
+    MAX_SPEED,
+    MIN_SEMITONES,
+    MIN_SPEED,
+    SPEED_STEP,
+    TranspositionCache,
+    processed_length,
+)
 from .background import BackgroundCall
 from .cache_dialog import CacheDialog
 from .settings import AppSettings
@@ -64,7 +72,7 @@ from .transpose_job import TransposeJob
 
 AUDIO_FILTER = "Audio files (*.wav *.flac *.mp3 *.ogg *.m4a *.aac *.opus *.aiff *.aif);;All files (*)"
 UI_REFRESH_MS = 30
-TRANSPOSE_DEBOUNCE_MS = 350  # wait for the user to stop clicking before rendering
+TRANSPOSE_DEBOUNCE_MS = 350  # wait for the user to stop clicking before rendering (transpose and speed)
 METRONOME = "metronome"
 METRONOME_DEFAULT_GAIN = 0.7  # about -3 dB
 
@@ -89,6 +97,21 @@ class SemitoneSpinBox(QSpinBox):
 
     def valueFromText(self, text: str) -> int:
         return int(text.replace("st", "").strip() or 0)
+
+
+class SpeedSpinBox(QSpinBox):
+    """Playback speed as a percentage of the original tempo; like
+    SemitoneSpinBox it takes no keyboard focus."""
+
+    def __init__(self):
+        super().__init__()
+        self.setRange(MIN_SPEED, MAX_SPEED)
+        self.setSingleStep(SPEED_STEP)
+        self.setValue(100)
+        self.setSuffix("%")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setToolTip("Speed of all tracks, keeping the pitch (. / , keys, Ctrl+0 to reset)")
 
 
 class MainWindow(QMainWindow):
@@ -116,9 +139,11 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings()
         self._separated = False
         self._job: SeparationJob | None = None
-        # Transposition: originals + cached versions for the current track set.
+        # Transposition and speed: originals + cached processed versions for the
+        # current track set.
         self._transpose_cache: TranspositionCache | None = None
         self._semitones = 0  # applied to the engine
+        self._speed = 100  # applied to the engine (percent)
         self._transpose_job: TransposeJob | None = None
         self._track_generation = 0  # bumps whenever the track set changes
         self._transpose_timer = QTimer(self)
@@ -218,6 +243,16 @@ class MainWindow(QMainWindow):
         self.act_transpose_reset.setShortcut(QKeySequence("0"))
         self.act_transpose_reset.triggered.connect(lambda: self.transpose_spin.setValue(0))
 
+        self.act_speed_up = QAction("Speed u&p", self)
+        self.act_speed_up.setShortcut(QKeySequence("."))
+        self.act_speed_up.triggered.connect(lambda: self.speed_spin.stepUp())
+        self.act_speed_down = QAction("Slo&w down", self)
+        self.act_speed_down.setShortcut(QKeySequence(","))
+        self.act_speed_down.triggered.connect(lambda: self.speed_spin.stepDown())
+        self.act_speed_reset = QAction("Reset spee&d", self)
+        self.act_speed_reset.setShortcut(QKeySequence("Ctrl+0"))
+        self.act_speed_reset.triggered.connect(lambda: self.speed_spin.setValue(100))
+
         self.act_separate = QAction(
             theme.icon("split"), "&Separate into stems", self)
         self.act_separate.setShortcut("Ctrl+E")
@@ -241,7 +276,7 @@ class MainWindow(QMainWindow):
 
         self.act_render = QAction("&Render mix…", self)
         self.act_render.setShortcut("Ctrl+Shift+E")
-        self.act_render.setToolTip("Render the audible tracks (with transposition) to one audio file")
+        self.act_render.setToolTip("Render the audible tracks (with transposition and speed) to one audio file")
         self.act_render.triggered.connect(lambda: self.render_to_file(loop_only=False))
         self.act_render_loop = QAction("Render &loop region…", self)
         self.act_render_loop.triggered.connect(lambda: self.render_to_file(loop_only=True))
@@ -289,6 +324,10 @@ class MainWindow(QMainWindow):
         transport_menu.addAction(self.act_transpose_up)
         transport_menu.addAction(self.act_transpose_down)
         transport_menu.addAction(self.act_transpose_reset)
+        transport_menu.addSeparator()
+        transport_menu.addAction(self.act_speed_up)
+        transport_menu.addAction(self.act_speed_down)
+        transport_menu.addAction(self.act_speed_reset)
         beats_menu = self.menuBar().addMenu("&Beats")
         beats_menu.addAction(self.act_count_in)
         beats_menu.addSeparator()
@@ -314,24 +353,28 @@ class MainWindow(QMainWindow):
         self.time_label.setTextFormat(Qt.TextFormat.RichText)
         tb.addWidget(self.time_label)
         tb.addSeparator()
-        caption = QLabel("TRANSPOSE")
-        caption.setObjectName("toolbarCaption")
-        tb.addWidget(caption)
         self.transpose_spin = SemitoneSpinBox()
         self.transpose_spin.valueChanged.connect(self._on_transpose_value_changed)
+        self.speed_spin = SpeedSpinBox()
+        self.speed_spin.valueChanged.connect(self._on_transpose_value_changed)
         self._step_buttons = []
-        for action, text in ((self.act_transpose_down, "−"), (self.act_transpose_up, "+")):
-            if text == "+":
-                tb.addWidget(self.transpose_spin)
-            button = QToolButton()
-            button.setText(text)
-            button.setToolTip(action.text().replace("&", ""))
-            button.setObjectName("stepButton")
-            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            button.clicked.connect(action.trigger)
-            tb.addWidget(button)
-            self._step_buttons.append(button)
-        tb.addSeparator()
+        for title, spin, down, up in (("TRANSPOSE", self.transpose_spin, self.act_transpose_down, self.act_transpose_up),
+                                      ("SPEED", self.speed_spin, self.act_speed_down, self.act_speed_up)):
+            caption = QLabel(title)
+            caption.setObjectName("toolbarCaption")
+            tb.addWidget(caption)
+            for action, text in ((down, "−"), (up, "+")):
+                if text == "+":
+                    tb.addWidget(spin)
+                button = QToolButton()
+                button.setText(text)
+                button.setToolTip(action.text().replace("&", ""))
+                button.setObjectName("stepButton")
+                button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                button.clicked.connect(action.trigger)
+                tb.addWidget(button)
+                self._step_buttons.append(button)
+            tb.addSeparator()
         self.beat_label = QLabel()
         self.beat_label.setObjectName("beatDisplay")
         self.beat_label.setToolTip("Bar.beat and tempo at the playhead (from the detected beats)")
@@ -379,7 +422,7 @@ class MainWindow(QMainWindow):
             self.statusBar().addPermanentWidget(w)
             w.hide()
 
-        # Transposition progress.
+        # Transposition / speed change progress.
         self.tr_label = QLabel()
         self.tr_progress = QProgressBar()
         self.tr_progress.setFixedWidth(140)
@@ -426,7 +469,7 @@ class MainWindow(QMainWindow):
 
     def _set_tracks(self, tracks: list[Track], sample_rate: int, keep_transport: bool = False) -> None:
         """Load a new track set. ``keep_transport``: same song (original ->
-        stems), so keep position, play state, loop and transposition."""
+        stems), so keep position, play state, loop, transposition and speed."""
         position, playing = self.engine.position, self.engine.is_playing
         loop, loop_on = self.timeline.loop, self.timeline.loop_enabled
         self._clear_beats()
@@ -476,6 +519,7 @@ class MainWindow(QMainWindow):
             separated=self._separated,
             model=DEFAULT_MODEL if self._separated else None,
             transpose=self.transpose_spin.value(),
+            speed=self.speed_spin.value(),
             loop=tl.loop,
             loop_enabled=tl.loop is not None and tl.loop_enabled,
             position=self.engine.position,
@@ -532,13 +576,14 @@ class MainWindow(QMainWindow):
     # ----- render ----------------------------------------------------------
 
     def render_to_file(self, loop_only: bool = False, path: str | Path | None = None) -> Path | None:
-        """Render what is audible (mute/solo, current transposition) to one file.
-        Asks for the file name unless ``path`` is given."""
+        """Render what is audible (mute/solo, current transposition and speed)
+        to one file. Asks for the file name unless ``path`` is given."""
         if not self.engine.is_loaded:
             return None
-        if self._transpose_job is not None or self._semitones != self.transpose_spin.value():
+        if self._transpose_job is not None or (self._semitones, self._speed) != self._target_version():
             QMessageBox.information(self, "Transposition in progress",
-                                    "Please wait until the transposition has finished, then render again.")
+                                    "Please wait until the transposition or speed change has finished, "
+                                    "then render again.")
             return None
         loop = self.timeline.loop if loop_only else None
         if loop_only and not self.timeline.loop_valid:
@@ -547,10 +592,11 @@ class MainWindow(QMainWindow):
             path = self._ask_render_path(loop)
             if path is None:
                 return None
+        # The tracks play at the current speed: convert the loop from song time.
+        bounds = (None, None) if loop is None else tuple(t * 100 / self._speed for t in loop)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            result = render_mix(self.engine.tracks, self.engine.sample_rate, path,
-                                *(loop if loop is not None else (None, None)))
+            result = render_mix(self.engine.tracks, self.engine.sample_rate, path, *bounds)
         except (RenderError, OSError) as e:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Render failed", str(e))
@@ -568,6 +614,8 @@ class MainWindow(QMainWindow):
         name = f"{stem} - backing"
         if self._semitones:
             name += f" {self._semitones:+d}st"
+        if self._speed != 100:
+            name += f" {self._speed}%"
         if loop is not None:
             name += f" {format_time(loop[0], False).replace(':', '.')}-{format_time(loop[1], False).replace(':', '.')}"
         directory = self._last_render_dir or (self._source_path.parent if self._source_path else Path.home())
@@ -680,6 +728,7 @@ class MainWindow(QMainWindow):
                 self.timeline.set_loop(*settings.loop, enabled=settings.loop_enabled)
             self.engine.seek(settings.position)
             self.transpose_spin.setValue(settings.transpose)
+            self.speed_spin.setValue(settings.speed)
             self._apply_transpose()  # no need to wait for the debounce
             self._metronome_settings = settings.metronome
             if settings.beats and settings.beats.get("beats"):
@@ -710,19 +759,30 @@ class MainWindow(QMainWindow):
             self._start_beats_job(paths, gains, Path(tmp), temporary=True)
         return True
 
-    # ----- transposition -------------------------------------------------
+    # ----- transposition and speed ------------------------------------------
+    # Both are rendered together by one job; "transposition" below covers both.
+
+    def _target_version(self) -> tuple[int, int]:
+        """(semitones, speed) the controls ask for."""
+        return (self.transpose_spin.value(), self.speed_spin.value())
+
+    def _set_controls(self, semitones: int, speed: int) -> None:
+        """Set the transpose/speed controls without triggering a render."""
+        for spin, value in ((self.transpose_spin, semitones), (self.speed_spin, speed)):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
 
     def _reset_transposition(self, keep_value: bool) -> None:
-        """New track set loaded at original pitch: start over, re-rendering the
-        current transposition for the new tracks if it should be kept."""
+        """New track set loaded at original pitch and tempo: start over,
+        re-rendering the current transposition and speed for the new tracks if
+        they should be kept."""
         self._cancel_transpose_job()
         self._track_generation += 1
         self._transpose_cache = TranspositionCache([(t.name, t.data) for t in self.engine.tracks if t.is_audio])
-        self._semitones = 0
+        self._semitones, self._speed = 0, 100
         if not keep_value:
-            self.transpose_spin.blockSignals(True)
-            self.transpose_spin.setValue(0)
-            self.transpose_spin.blockSignals(False)
+            self._set_controls(0, 100)
         self._apply_transpose()
 
     def _on_transpose_value_changed(self, _value: int) -> None:
@@ -731,22 +791,21 @@ class MainWindow(QMainWindow):
 
     def _apply_transpose(self) -> None:
         self._transpose_timer.stop()
-        target = self.transpose_spin.value()
+        target = self._target_version()
         cache = self._transpose_cache
         if cache is None:
             return
         job = self._transpose_job
-        if job is not None and job.semitones == target and job.generation == self._track_generation:
+        if job is not None and job.version == target and job.generation == self._track_generation:
             return  # already rendering this
         self._cancel_transpose_job()
         datas = cache.get(target)
         if datas is not None:
-            if target != self._semitones:
-                self._swap_audio(datas)
-                self._semitones = target
+            if target != (self._semitones, self._speed):
+                self._apply_version(target, datas)
             self._update_transpose_status()
             return
-        job = TransposeJob(cache.originals, self.engine.sample_rate, target, self._track_generation, parent=self)
+        job = TransposeJob(cache.originals, self.engine.sample_rate, *target, self._track_generation, parent=self)
         job.progress.connect(self._on_transpose_progress)
         job.finished.connect(self._on_transpose_finished)
         job.failed.connect(self._on_transpose_failed)
@@ -755,11 +814,25 @@ class MainWindow(QMainWindow):
         job.start()
         self._on_transpose_progress(0.0)
 
-    def _swap_audio(self, datas: list) -> None:
-        """Swap in transposed audio for the song's tracks; generated tracks
-        (the metronome) keep theirs."""
+    def _apply_version(self, version: tuple[int, int], datas: list) -> None:
+        self._swap_audio(datas, speed=version[1])
+        self._semitones, self._speed = version
+
+    def _swap_audio(self, datas: list, speed: int | None = None) -> None:
+        """Swap in processed audio for the song's tracks, playing at ``speed``
+        % (default: unchanged). Generated tracks (the metronome) are never
+        transposed; at a new speed they are regenerated rather than stretched."""
+        speed = self._speed if speed is None else speed
         it = iter(datas)
-        self.engine.swap_audio([next(it) if t.is_audio else t.data for t in self.engine.tracks])
+        new = []
+        for t in self.engine.tracks:
+            if t.is_audio:
+                new.append(next(it))
+            elif t.kind == METRONOME and speed != self._speed and self._beat_grid is not None:
+                new.append(self._metronome_audio(speed))
+            else:
+                new.append(t.data)
+        self.engine.swap_audio(new, speed / 100)
 
     def _cancel_transpose_job(self) -> None:
         if self._transpose_job is not None:
@@ -771,22 +844,22 @@ class MainWindow(QMainWindow):
         job = self._transpose_job
         if job is None:
             return
-        self.tr_label.setText(f"Transposing {job.semitones:+d}…")
+        parts = [f"{job.semitones:+d} st" if job.semitones else "", f"{job.speed}%" if job.speed != 100 else ""]
+        self.tr_label.setText(f"Rendering {', '.join(p for p in parts if p) or 'original'}…")
         # Tracks render in parallel and finish together, so a percentage would
         # sit at 0% then jump: show a busy indicator instead.
         self.tr_progress.setRange(0, 0)
         self.tr_label.show()
         self.tr_progress.show()
 
-    def _on_transpose_finished(self, semitones: int, datas: list) -> None:
+    def _on_transpose_finished(self, version: tuple[int, int], datas: list) -> None:
         job = self.sender()
         if job is not self._transpose_job or job.generation != self._track_generation:
             return  # stale result for an old track set
         self._transpose_job = None
-        self._transpose_cache.put(semitones, datas)
-        if semitones == self.transpose_spin.value():
-            self._swap_audio(datas)
-            self._semitones = semitones
+        self._transpose_cache.put(version, datas)
+        if version == self._target_version():
+            self._apply_version(version, datas)
         self._update_transpose_status()
         self._apply_transpose()  # in case the target moved on meanwhile
 
@@ -795,9 +868,7 @@ class MainWindow(QMainWindow):
             return
         self._transpose_job = None
         self._update_transpose_status()
-        self.transpose_spin.blockSignals(True)
-        self.transpose_spin.setValue(self._semitones)  # back to what's playing
-        self.transpose_spin.blockSignals(False)
+        self._set_controls(self._semitones, self._speed)  # back to what's playing
         QMessageBox.warning(self, "Transpose failed", message)
 
     def _update_transpose_status(self) -> None:
@@ -1008,8 +1079,7 @@ class MainWindow(QMainWindow):
         self.act_half_beat.blockSignals(False)
         self._beat_grid = effective_grid(detected, corrections)
         self._beat_numbers = self._beat_grid.beat_numbers()
-        frames = int(round(self.engine.duration * self.engine.sample_rate))
-        audio = metronome_audio(self._beat_grid, frames, self.engine.sample_rate)
+        audio = self._metronome_audio(self._speed)
 
         idx = self._metronome_index()
         if idx is None:
@@ -1030,6 +1100,20 @@ class MainWindow(QMainWindow):
         self._update_reference_peaks()
         self._update_actions()
         self._update_beat_label()
+
+    def _playback_grid(self, speed: int) -> BeatGrid:
+        """The beat grid in the time of audio played at ``speed`` %."""
+        grid = self._beat_grid
+        if speed == 100:
+            return grid
+        s = speed / 100
+        return BeatGrid(grid.beats / s, grid.downbeats / s)
+
+    def _metronome_audio(self, speed: int) -> np.ndarray:
+        """Metronome clicks for the whole song played at ``speed`` %."""
+        sr = self.engine.sample_rate
+        frames = processed_length(int(round(self.engine.duration * sr)), speed)
+        return metronome_audio(self._playback_grid(speed), frames, sr)
 
     def _correct_beats(self, tempo: int = 0, bar_offset: int = 0, half_beat: bool | None = None) -> None:
         if self._beats_detected is None:
@@ -1137,15 +1221,16 @@ class MainWindow(QMainWindow):
         self._refresh()
 
     def _play_with_count_in(self) -> None:
+        s = self._speed / 100  # the clicks follow the playing tempo
         try:
-            ci = count_in(self._beat_grid, self.engine.start_position, self.engine.sample_rate)
+            ci = count_in(self._playback_grid(self._speed), self.engine.start_position / s, self.engine.sample_rate)
         except BeatError:
             self.engine.play()
             return
         idx = self._metronome_index()
         gain = self.engine.tracks[idx].gain if idx is not None else METRONOME_DEFAULT_GAIN
         # The count-in plays even if the metronome track is muted (that's the point).
-        self.engine.play_with_count_in(ci.audio * max(gain, 0.3), ci.start)
+        self.engine.play_with_count_in(ci.audio * max(gain, 0.3), ci.start * s)
 
     def _on_count_in_toggled(self, on: bool) -> None:
         self.settings.count_in = on
@@ -1188,7 +1273,7 @@ class MainWindow(QMainWindow):
             return
         pos = self.engine.position
         i = int(np.searchsorted(grid.beats, pos + 0.02, side="right")) - 1
-        tempo = grid.tempo_at(pos)
+        tempo = grid.tempo_at(pos) * self._speed / 100  # as heard
         if i < 0:
             self.beat_label.setText(f"Bar –  ·  {tempo:.0f} BPM")
             return
@@ -1208,7 +1293,7 @@ class MainWindow(QMainWindow):
         self.act_separate.setEnabled(
             self._source_path is not None and self._job is None and not self._separated)
         for w in (self.transpose_spin, self.act_transpose_up, self.act_transpose_down, self.act_transpose_reset,
-                  self.act_save, self.act_save_as, self.act_render, *self._step_buttons):
+                  self.speed_spin, self.act_speed_up, self.act_speed_down, self.act_speed_reset, self.act_save, self.act_save_as, self.act_render, *self._step_buttons):
             w.setEnabled(loaded)
         self.act_render_loop.setEnabled(loaded and self.timeline.loop_valid)
         has_beats = self._beats_detected is not None
@@ -1220,6 +1305,11 @@ class MainWindow(QMainWindow):
     def semitones(self) -> int:
         """Transposition currently heard."""
         return self._semitones
+
+    @property
+    def speed(self) -> int:
+        """Speed currently heard, in percent of the original tempo."""
+        return self._speed
 
     def closeEvent(self, event):
         if not self._confirm_discard():

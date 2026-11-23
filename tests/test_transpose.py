@@ -7,6 +7,7 @@ import pytest
 from backing_track_generator.transpose import (
     Cancelled,
     TranspositionCache,
+    processed_length,
     rubberband_available,
     transpose_tracks,
 )
@@ -68,10 +69,26 @@ def test_failure_reports_error(monkeypatch, tmp_path):
 def test_cache_lru():
     orig = [("a", np.zeros((4, 2), np.float32))]
     c = TranspositionCache(orig, max_versions=2)
-    assert c.get(0)[0] is orig[0][1]
+    assert c.get((0, 100))[0] is orig[0][1]
     for k in (1, 2):
-        c.put(k, [np.full((4, 2), k, np.float32)])
-    c.get(1)  # touch 1 so 2 is the oldest
-    c.put(3, [np.full((4, 2), 3, np.float32)])
-    assert c.get(2) is None and c.get(1) is not None and c.get(3) is not None
-    assert c.cached() == [0, 1, 3]
+        c.put((k, 100), [np.full((4, 2), k, np.float32)])
+    c.get((1, 100))  # touch 1 so 2 is the oldest
+    c.put((0, 80), [np.full((5, 2), 3, np.float32)])
+    assert c.get((2, 100)) is None and c.get((1, 100)) is not None and c.get((0, 80)) is not None
+    assert c.cached() == [(0, 100), (1, 100), (0, 80)]
+
+
+@needs_rubberband
+@pytest.mark.parametrize("speed, semitones", [(80, 0), (125, 0), (70, 2)])
+def test_speed_changes_length_not_pitch(speed, semitones):
+    src = sine(220)
+    out = transpose_tracks([("bass", src)], SR, semitones, speed)[0]
+    assert out.shape == (processed_length(len(src), speed), 2) and out.dtype == np.float32
+    assert out.shape[0] == pytest.approx(len(src) * 100 / speed, abs=1)
+    ratio = 2 ** (semitones / 12)
+    assert dominant_freq(out[SR // 4: -SR // 4]) == pytest.approx(220 * ratio, rel=0.02)
+
+
+def test_original_speed_and_pitch_is_identity():
+    data = sine(220)
+    assert transpose_tracks([("a", data)], SR, 0, 100)[0] is data

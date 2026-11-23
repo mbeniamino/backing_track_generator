@@ -4,8 +4,8 @@
       project.json
       tracks/vocals.flac, tracks/drums.flac, ...
 
-Tracks are stored at original pitch; the transposition is a setting that is
-re-applied on load. The FLAC files are ordinary audio files, usable on their own.
+Tracks are stored at original pitch and tempo; the transposition and the
+speed are settings that are re-applied on load. The FLAC files are ordinary audio files, usable on their own.
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ class ProjectSettings:
     separated: bool = False
     model: str | None = None
     transpose: int = 0
+    speed: int = 100  # percent of the original tempo
     loop: tuple[float, float] | None = None
     loop_enabled: bool = False
     position: float = 0.0
@@ -90,6 +91,7 @@ def _settings_json(settings: ProjectSettings, files: list[tuple[str, float]]) ->
         "model": settings.model,
         "sample_rate": settings.sample_rate,
         "transpose": settings.transpose,
+        "speed": settings.speed,
         "loop": None if settings.loop is None else {
             "start": settings.loop[0], "end": settings.loop[1], "enabled": settings.loop_enabled},
         "position": settings.position,
@@ -148,7 +150,7 @@ def _read_json(path: Path) -> dict:
     return doc
 
 
-_KNOWN_KEYS = {"format", "version", "source", "separated", "model", "sample_rate", "transpose", "loop",
+_KNOWN_KEYS = {"format", "version", "source", "separated", "model", "sample_rate", "transpose", "speed", "loop",
                "position", "tracks", "beats", "metronome"}
 
 
@@ -182,6 +184,7 @@ def load_project(path: str | Path) -> tuple[ProjectSettings, list[np.ndarray], P
             separated=bool(doc.get("separated", False)),
             model=doc.get("model"),
             transpose=int(doc.get("transpose", 0)),
+            speed=int(doc.get("speed", 100)),
             loop=None if not loop else (float(loop["start"]), float(loop["end"])),
             loop_enabled=bool(loop and loop.get("enabled", False)),
             position=float(doc.get("position", 0.0)),

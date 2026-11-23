@@ -388,6 +388,38 @@ def test_swap_audio_keeps_transport_and_crossfades():
     assert eng.tracks[0].tail_data is None  # old audio released after the crossfade
 
 
+def test_swap_audio_at_new_speed_keeps_song_time():
+    eng = sine_engine()  # 1 s at SR 8000
+    eng.set_loop(0.2, 0.8)
+    eng.seek(0.5)
+    eng.play()
+    render(eng, 80)
+    pos = eng.position
+    eng.swap_audio([np.zeros((10000, 2), np.float32)], speed=0.8)  # slower: 1.25 s of audio
+    assert eng.speed == 0.8 and eng.frames == 10000
+    assert eng.duration == pytest.approx(1.0)  # song time is unchanged
+    assert eng.position == pytest.approx(pos, abs=1e-3) and eng.is_playing and eng.loop_active
+    # A quarter of a second of real time covers only 0.2 s of the song.
+    render(eng, 2000)
+    assert eng.position == pytest.approx(pos + 0.2, abs=1e-3)
+    eng.seek(0.6)
+    assert eng.position == pytest.approx(0.6, abs=1e-3)
+    # The loop end (song time 0.8) is at frame 8000 of the slower audio.
+    render(eng, 2000)
+    assert eng.position == pytest.approx(0.2, abs=1e-3)
+    # Back to the original tempo.
+    eng.swap_audio([np.zeros((8000, 2), np.float32)], speed=1.0)
+    assert eng.frames == 8000 and eng.position == pytest.approx(0.2, abs=1e-3)
+
+
+def test_load_resets_speed():
+    eng = make_engine(const_track("a", 0.1, frames=100))
+    eng.swap_audio([np.ones((50, 2), np.float32)], speed=2.0)
+    assert eng.frames == 50 and eng.duration == pytest.approx(0.1)
+    eng.load([const_track("a", 0.1, frames=100)], SR)
+    assert eng.speed == 1.0 and eng.frames == 100
+
+
 def test_swap_audio_fits_length_and_checks_count():
     eng = make_engine(const_track("a", 0.1, frames=100))
     eng.swap_audio([np.ones((80, 2), np.float32)])

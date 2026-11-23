@@ -54,6 +54,11 @@ class AudioEngine:
 
     All state shared with the audio callback is guarded by ``_lock``; the
     callback does only slicing and summing, so the lock is held briefly.
+
+    The tracks may be playing at a changed tempo (see ``swap_audio``): their
+    audio then lasts ``1 / speed`` times as long as the song. Times in seconds
+    (position, seek, loop, duration) are always song time, as if at the
+    original tempo; frames are always frames of the audio being played.
     """
 
     def __init__(self, use_device: bool = True):
@@ -62,10 +67,14 @@ class AudioEngine:
         self._tracks: list[Track] = []
         self._sample_rate = 44100
         self._length = 0  # frames
+        self._song_length = 0  # frames at the original tempo
+        self._speed = 1.0  # tempo of the playing audio relative to the original
         self._pos = 0  # frames
         self._playing = False
         self._stream = None
-        # Loop region in frames; active only when enabled and valid.
+        # Loop region in frames; active only when enabled and valid. Also kept
+        # in song seconds, to recompute the frames exactly when the tempo changes.
+        self._loop_secs = (0.0, 0.0)
         self._loop_enabled = False
         self._loop_start = 0
         self._loop_end = 0
@@ -95,10 +104,12 @@ class AudioEngine:
         with self._lock:
             self._playing = False
             self._tracks = tracks
-            self._length = length
+            self._length = self._song_length = length
+            self._speed = 1.0
             self._pos = 0
             self._xfade_left = 0
             self._loop_enabled = False
+            self._loop_secs = (0.0, 0.0)
             self._loop_start = self._loop_end = 0
             self._cancel_count_in()
         if sample_rate != self._sample_rate or self._stream is None:
@@ -115,7 +126,25 @@ class AudioEngine:
 
     @property
     def duration(self) -> float:
-        return self._length / self._sample_rate
+        """Song duration in seconds (at the original tempo)."""
+        return self._song_length / self._sample_rate
+
+    @property
+    def frames(self) -> int:
+        """Length of the audio being played, in frames."""
+        return self._length
+
+    @property
+    def speed(self) -> float:
+        """Tempo of the audio being played, relative to the original (1.0)."""
+        return self._speed
+
+    def _to_frame(self, seconds: float) -> int:
+        """Song time -> frame of the playing audio (clamped)."""
+        return min(max(int(round(seconds * self._sample_rate / self._speed)), 0), self._length)
+
+    def _to_seconds(self, frame: int) -> float:
+        return frame * self._speed / self._sample_rate
 
     @property
     def is_loaded(self) -> bool:
@@ -183,8 +212,8 @@ class AudioEngine:
 
     @property
     def position(self) -> float:
-        """Playhead position in seconds."""
-        return self._pos / self._sample_rate
+        """Playhead position in song seconds."""
+        return self._to_seconds(self._pos)
 
     def play(self) -> None:
         """Start playing. With an active loop, playback starts inside it: from
@@ -204,19 +233,21 @@ class AudioEngine:
 
     @property
     def start_position(self) -> float:
-        """Where play() would start, in seconds."""
+        """Where play() would start, in song seconds."""
         with self._lock:
-            return self._start_frame() / self._sample_rate
+            return self._to_seconds(self._start_frame())
 
     def play_with_count_in(self, clicks: np.ndarray, clicks_start: float) -> None:
         """Like play(), but first play ``clicks`` (audio whose first frame is at
         song time ``clicks_start``): the part before the start position plays
-        before the song, the rest on top of it."""
+        before the song, the rest on top of it. ``clicks`` must be made for the
+        current tempo."""
         with self._lock:
             if self._length == 0:
                 return
             self._pos = self._start_frame()
-            offset = self._pos - int(round(clicks_start * self._sample_rate))  # overlay frame at the start position
+            # Overlay frame at the start position.
+            offset = self._pos - int(round(clicks_start * self._sample_rate / self._speed))
             self._overlay = clicks
             self._preroll = max(offset, 0)
             self._overlay_pos = 0 if offset >= 0 else offset
@@ -255,7 +286,7 @@ class AudioEngine:
             self._pos = self._loop_start if self._loop_active() else 0
 
     def seek(self, seconds: float) -> None:
-        frame = min(max(int(round(seconds * self._sample_rate)), 0), self._length)
+        frame = self._to_frame(seconds)
         with self._lock:
             if self._playing and frame != self._pos:
                 self._begin_crossfade(self._pos)
@@ -267,11 +298,9 @@ class AudioEngine:
     def set_loop(self, start: float, end: float, enabled: bool = True) -> None:
         """Set the loop region in seconds. Playback reaching ``end`` from before
         it jumps back to ``start``; past ``end`` the song plays out normally."""
-        sr = self._sample_rate
-        a = min(max(int(round(min(start, end) * sr)), 0), self._length)
-        b = min(max(int(round(max(start, end) * sr)), 0), self._length)
         with self._lock:
-            self._loop_start, self._loop_end = a, b
+            self._loop_secs = (min(start, end), max(start, end))
+            self._loop_start, self._loop_end = map(self._to_frame, self._loop_secs)
             self._loop_enabled = enabled
 
     def set_loop_enabled(self, enabled: bool) -> None:
@@ -313,17 +342,23 @@ class AudioEngine:
         for t in self._tracks:
             t.tail_data = None  # don't keep a whole old version alive
 
-    def swap_audio(self, datas: list[np.ndarray]) -> None:
+    def swap_audio(self, datas: list[np.ndarray], speed: float | None = None) -> None:
         """Replace every track's audio (e.g. a transposed version) keeping
-        position, loop, mute/solo and play state. Arrays are padded/trimmed to
-        the current length. While playing, the old audio crossfades into the new."""
+        position, loop, mute/solo and play state. While playing, the old audio
+        crossfades into the new.
+
+        ``speed``: the tempo of the new audio relative to the original (default:
+        unchanged). Arrays are padded/trimmed to the song length at that tempo,
+        and the playhead and loop move to the same song time in the new audio."""
         if len(datas) != len(self._tracks):
             raise ValueError("swap_audio: track count mismatch")
+        speed = self._speed if speed is None else float(speed)
+        length = self._song_length if speed == 1.0 else int(round(self._song_length / speed))
         fitted = []
         for d in datas:
-            if d.shape[0] < self._length:
-                d = np.concatenate([d, np.zeros((self._length - d.shape[0], CHANNELS), np.float32)])
-            fitted.append(d[: self._length])
+            if d.shape[0] < length:
+                d = np.concatenate([d, np.zeros((length - d.shape[0], CHANNELS), np.float32)])
+            fitted.append(d[:length])
         with self._lock:
             if self._playing:
                 self._begin_crossfade(self._pos)
@@ -331,6 +366,13 @@ class AudioEngine:
                     t.tail_data = t.data
             for t, d in zip(self._tracks, fitted):
                 t.data = d
+            if speed != self._speed:
+                song_pos = self._to_seconds(self._pos)
+                self._speed, self._length = speed, length
+                self._pos = self._to_frame(song_pos)
+                self._loop_start, self._loop_end = map(self._to_frame, self._loop_secs)
+                if self._preroll == 0:
+                    self._overlay = None  # count-in clicks overlapping the song: at the old tempo
 
     def render_block(self, out: np.ndarray) -> None:
         """Fill ``out`` (frames, 2) with the next block and advance the playhead,

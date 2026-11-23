@@ -56,6 +56,7 @@ app/
 6. ✅ Projects: folder with project.json + tracks/*.flac (original pitch); Save/Save As/Open, dirty tracking + prompt, settings-only re-save, atomic writes.
 7. ✅ Render: audible tracks at current transposition (whole song or loop) to WAV/FLAC/MP3/Ogg; scaled instead of clipped.
 8. ✅ Beats with beat_this → metronome track (follows tempo changes), count-in, manual corrections (×2, ÷2, bar start, half-beat).
+9. ✅ Speed 50–150 % (Rubber Band, same pass and cache as transposition, keyed by (semitones, speed)); the engine keeps song time for position/loop/seek, metronome and count-in regenerated at the playing tempo.
 
 ## Risks
 - torch/Demucs compatibility → pinned Python 3.12 venv.

@@ -12,6 +12,8 @@ These are the features to implement:
 - the user can set a loop for playing setting two loop points in the timeline;
 - the user can choose to transpose the tracks by an integer number of semitones
   (negative values included);
+- the user can slow down or speed up the tempo of the tracks (without changing
+  their pitch);
 - the user can save the single tracks and the current settings as a project;
 - the user can render the current audible tracks to a single audio file;
 

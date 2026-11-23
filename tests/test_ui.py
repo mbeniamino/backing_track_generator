@@ -301,7 +301,7 @@ def test_rapid_changes_only_render_final_value(qapp, tmp_path):
     assert win.transpose_spin.value() == -4
     assert win._transpose_job is None  # debounce: nothing started yet
     wait_until(qapp, lambda: win.semitones == -4)
-    assert win._transpose_cache.cached() == [0, -4]
+    assert win._transpose_cache.cached() == [(0, 100), (-4, 100)]
     win.close()
 
 
@@ -1127,3 +1127,94 @@ def test_project_keeps_unmuted_metronome(qapp, tmp_path, dialogs):
     win2.open_project(tmp_path / "p")
     assert not win2.engine.tracks[2].mute  # the saved state wins over the default
     win2.close()
+
+
+# ----- speed -------------------------------------------------------------------------
+
+@rubberband
+def test_speed_change_keeps_song_time_and_renders_stretched(qapp, tmp_path, dialogs):
+    from backing_track_generator.audio_io import load_audio
+
+    win, _ = stems_window(tmp_path)
+    win.timeline.set_loop(0.5, 1.5, enabled=True)
+    win.engine.seek(0.7)
+    win.act_speed_down.trigger()
+    win.act_speed_down.trigger()
+    assert win.speed_spin.value() == 90 and win.speed == 100  # debounced
+    wait_until(qapp, lambda: win.speed == 90)
+    assert win.semitones == 0
+    assert win.engine.frames == round(88200 / 0.9)
+    assert win.engine.duration == pytest.approx(2.0) and win.timeline.duration == pytest.approx(2.0)
+    assert win.engine.position == pytest.approx(0.7, abs=0.01) and win.engine.loop_active
+
+    # Renders at the new speed: the loop (1 s of song) lasts 1 / 0.9 s.
+    data, _ = load_audio(win.render_to_file(loop_only=True, path=tmp_path / "loop.wav"))
+    assert data.shape[0] == pytest.approx(44100 / 0.9, abs=2)
+    data, _ = load_audio(win.render_to_file(path=tmp_path / "all.wav"))
+    assert data.shape[0] == win.engine.frames
+
+    # Combined with a transposition; then saved and reopened.
+    win.transpose_spin.setValue(-2)
+    wait_until(qapp, lambda: win.semitones == -2)
+    assert win.speed == 90 and win._transpose_cache.cached()[-1] == (-2, 90)
+    dialogs["save_path"] = tmp_path / "proj"
+    assert win.save_project_as()
+    win.close()
+
+    win2 = make_window()
+    assert win2.open_project(tmp_path / "proj")
+    assert win2.speed_spin.value() == 90 and win2.transpose_spin.value() == -2
+    assert all(d.shape[0] == 88200 for _, d in win2._transpose_cache.originals)  # saved at original tempo
+    wait_until(qapp, lambda: win2.speed == 90 and win2.semitones == -2)
+    win2.act_speed_reset.trigger()
+    win2._apply_transpose()
+    wait_until(qapp, lambda: win2.speed == 100)
+    assert win2.engine.frames == 88200
+    win2.close()
+
+
+def test_speed_regenerates_metronome_and_count_in(qapp, tmp_path):
+    win = make_window()
+    win.open_file(beats_song(tmp_path))
+    datas = [d for _, d in win._transpose_cache.originals]
+    # Stand-in for Rubber Band's output at 80 %.
+    win._swap_audio([np.zeros((round(d.shape[0] / 0.8), 2), np.float32) for d in datas], speed=80)
+    win._speed = 80
+    click = win.engine.tracks[2].data[:, 0]
+    assert click.shape[0] == win.engine.frames == round(4 * 44100 / 0.8)
+    first = int(0.25 / 0.8 * 44100)  # the first beat, at the slower tempo
+    assert not click[: first - 50].any() and np.abs(click[first: first + 400]).max() > 0.1
+    win.engine.seek(0.8)
+    win._refresh()
+    assert win.beat_label.text() == "Bar 1.2  ·  96 BPM"
+    # Beat corrections regenerate it at the playing tempo too.
+    win.act_tempo_double.trigger()
+    assert win.engine.tracks[2].data.shape[0] == win.engine.frames
+    win.act_beats_reset.trigger()
+    # The count-in follows the slower tempo.
+    win.act_count_in.setChecked(True)
+    win.engine.seek(0.0)
+    win.act_play.trigger()
+    assert win.engine.counting_in and win.engine.count_in_remaining == pytest.approx(1.75 / 0.8, abs=0.01)
+    win.engine.pause()
+    win.close()
+
+
+def test_speed_failure_reverts_value(qapp, tmp_path, monkeypatch):
+    from backing_track_generator.ui import main_window
+
+    warnings = []
+    monkeypatch.setattr(main_window.QMessageBox, "warning", lambda *a: warnings.append(a[2]))
+    fake = tmp_path / "bin" / "rubberband"
+    fake.parent.mkdir()
+    fake.write_text("#!/bin/sh\necho nope >&2\nexit 1\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake.parent))
+
+    win = make_window()
+    win.open_file(make_song(tmp_path), separate=False)
+    win.speed_spin.setValue(120)
+    win._apply_transpose()
+    wait_until(qapp, lambda: warnings)
+    assert win.speed_spin.value() == 100 and win.speed == 100
+    win.close()
