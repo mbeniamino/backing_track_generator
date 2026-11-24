@@ -95,6 +95,29 @@ RUN_SLOW=1 uv run pytest      # also runs Demucs end to end
 
 See `PLAN.md` for the design and milestones.
 
+## Windows installer
+
+```sh
+packaging/windows/build.sh    # → build/windows/BackingTrackGenerator-<version>-Setup.exe
+```
+
+Builds on Linux, no Windows machine needed: it bundles the official embeddable
+Python (3.13), the locked dependencies as Windows wheels (fetched by uv; only Qt's
+essentials, CPU-only PyTorch), the Microsoft C++ runtime and the app, and packs them
+with NSIS. It uses a native `makensis` when installed (AUR: `nsis`), otherwise it
+downloads a portable NSIS and runs it under Wine. Every download is checked against
+a pinned SHA-256 (the versions are at the top of the script).
+
+The installer (~130 MB) installs per user, without administrator rights, into
+`%LOCALAPPDATA%\Programs\Backing Track Generator`, with a Start menu shortcut and
+an optional desktop one. `/S` installs silently. Uninstalling keeps the separated
+stems, settings and downloaded models.
+
+Testing under Wine: use a separate `WINEPREFIX`, and set
+`WINEDLLOVERRIDES=winemenubuilder.exe=d` so the shortcuts don't end up in your Linux
+menu and desktop. The test suite can run on the installed Python
+(`…\python\python.exe`) with pytest's Windows wheels appended to `sys.path`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

@@ -232,3 +232,43 @@ def _draw_icon(p: QPainter, kind: str, c: QColor) -> None:
             p.drawEllipse(QPointF(19, y), 1.6, 1.6)
     else:
         raise ValueError(kind)
+
+
+# ----- application icon ------------------------------------------------------------
+
+APP_ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
+
+
+def app_icon_pixmap(size: int) -> QPixmap:
+    """The app icon: one line fanning out into colored stems, on a dark tile."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.scale(size / 24, size / 24)  # draw on a 24x24 grid
+    p.setPen(QPen(ACCENT, 0.6))
+    p.setBrush(PANEL)
+    p.drawRoundedRect(QRectF(0.5, 0.5, 23, 23), 5, 5)
+    width = 2.4 if size >= 32 else 3.0  # thicker lines stay visible when tiny
+    p.setPen(QPen(TEXT, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawLine(QPointF(4, 12), QPointF(9, 12))
+    for y, name in ((6, "vocals"), (12, "guitar"), (18, "bass")):
+        color = STEM_COLORS[name]
+        p.setPen(QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        path = QPainterPath(QPointF(9, 12))
+        path.cubicTo(QPointF(13, 12), QPointF(13, y), QPointF(17, y))
+        p.drawPath(path)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(QPointF(19, y), 1.9, 1.9)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+    p.end()
+    return pm
+
+
+def app_icon() -> QIcon:
+    ic = QIcon()
+    for size in APP_ICON_SIZES:
+        ic.addPixmap(app_icon_pixmap(size))
+    return ic
