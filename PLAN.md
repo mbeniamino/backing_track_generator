@@ -12,10 +12,8 @@ See `specs` for the feature list.
   phase reset, cepstral formant preservation, windowed-sinc resampling; numpy only) per stem.
   Playback processes in real time (`realtime.py`: background threads render each stem ~1 s
   ahead of the playhead, plus the loop start and pending seeks; the engine waits rather than
-  skips if audio isn't ready). File rendering runs the same code offline.
-  The Rubber Band CLI is an optional alternative engine that renders beforehand, in parallel
-  in the background; old audio keeps playing until the new one is ready, then hot-swapped.
-  Cached per semitone value (LRU-capped for memory).
+  skips if audio isn't ready). File rendering runs the same code offline, in parallel per
+  stem; the result is cached per (semitones, speed) (LRU-capped for memory).
 - **I/O:** `soundfile` + ffmpeg for decoding mp3/m4a/etc.
 - **Environment:** `uv`, Python 3.12 venv (torch/Demucs on 3.14 is risky).
 
@@ -27,7 +25,7 @@ app/
   engine.py         # audio stream, mixer, playhead, loop, mute/solo (thread-safe state)
   stretch.py        # built-in phase vocoder time-stretch + resampler (pitch shift), offline and streaming
   realtime.py       # renders the stems ahead of the playhead for real-time playback
-  transpose.py      # engine choice (built-in / rubberband) per stem, cache by semitone
+  transpose.py      # offline processing of all stems (for rendering), cache by (semitones, speed)
   project.py        # save/load: <name>/stems/*.flac + project.json
   render.py         # mix audible stems → WAV/FLAC
   ui/
@@ -59,11 +57,11 @@ app/
 2. ✅ Separation: Demucs in a background process with status-bar progress + cancel; stem cache in ~/.cache/backing-track-generator/stems (keyed by file hash + model).
 3. ✅ Multi-track lanes on a shared timeline + Mute/Solo (Ctrl+click = exclusive solo, 10 ms click-free gain ramps, inaudible lanes greyed).
 4. ✅ Loop: drag on ruler (edges adjustable), L toggles, [ ] set at playhead; 10 ms equal-power crossfade at wrap and on seek-while-playing.
-5. ✅ Transpose ±12 st: Rubber Band R3 (formant-preserving for vocals), parallel per stem, debounced, LRU cache of 2 versions, crossfaded hot-swap.
+5. ✅ Transpose ±12 st: built-in phase vocoder in real time (formant-preserving for vocals), debounced, crossfaded switch.
 6. ✅ Projects: folder with project.json + tracks/*.flac (original pitch); Save/Save As/Open, dirty tracking + prompt, settings-only re-save, atomic writes.
 7. ✅ Render: audible tracks at current transposition (whole song or loop) to WAV/FLAC/MP3/Ogg; scaled instead of clipped.
 8. ✅ Beats with beat_this → metronome track (follows tempo changes), count-in, manual corrections (×2, ÷2, bar start, half-beat).
-9. ✅ Speed 50–150 % (Rubber Band, same pass and cache as transposition, keyed by (semitones, speed)); the engine keeps song time for position/loop/seek, metronome and count-in regenerated at the playing tempo.
+9. ✅ Speed 50–150 % (same pass as transposition); the engine keeps song time for position/loop/seek, metronome and count-in regenerated at the playing tempo.
 
 ## Risks
 - torch/Demucs compatibility → pinned Python 3.12 venv.

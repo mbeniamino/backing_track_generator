@@ -12,9 +12,7 @@ saves the result as a project or renders it to a single audio file.
   (phase-locked, with sharp transients for drums and formant preservation for
   vocals) that processes the tracks in real time while they play: changes are
   heard within a fraction of a second. Rendering to a file uses the same
-  processing offline. [Rubber Band](https://breakfastquay.com/rubberband/) can
-  be used instead if it's installed (Transport → Pitch/speed engine); it
-  renders each setting before it plays.
+  processing offline.
 - **Metronome and count-in** from beats detected with
   [beat_this](https://github.com/CPJKU/beat_this): the clicks follow the song's
   actual beats, so tempo drift and tempo changes are tracked.
@@ -26,10 +24,7 @@ saves the result as a project or renders it to a single audio file.
   - `ffmpeg`, to open formats libsndfile can't read (m4a, aac, …)
   - PortAudio, for playback (usually already present)
 
-  - optionally, the `rubberband` command-line tool, as an alternative
-    transposition/speed engine
-
-  On Arch Linux: `pacman -S ffmpeg portaudio` (plus `rubberband` if wanted)
+  On Arch Linux: `pacman -S ffmpeg portaudio`
 
 The first `uv sync` downloads PyTorch (CPU-only build, ~1 GB).
 

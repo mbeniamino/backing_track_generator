@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QEventLoop, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -59,14 +59,9 @@ from ..transpose import (
     MAX_SPEED,
     MIN_SEMITONES,
     MIN_SPEED,
-    ENGINE_LABELS,
-    ENGINES,
-    NATIVE,
-    RUBBERBAND,
     SPEED_STEP,
     TranspositionCache,
     processed_length,
-    rubberband_available,
 )
 from .background import BackgroundCall
 from .cache_dialog import CacheDialog
@@ -79,8 +74,7 @@ from .transpose_job import TransposeJob
 
 AUDIO_FILTER = "Audio files (*.wav *.flac *.mp3 *.ogg *.m4a *.aac *.opus *.aiff *.aif);;All files (*)"
 UI_REFRESH_MS = 30
-TRANSPOSE_DEBOUNCE_MS = 350  # wait for the user to stop clicking before rendering (transpose and speed)
-REALTIME_DEBOUNCE_MS = 100  # the same for real-time processing, which is quick to start
+TRANSPOSE_DEBOUNCE_MS = 100  # wait for the user to stop clicking before switching (transpose and speed)
 METRONOME = "metronome"
 METRONOME_DEFAULT_GAIN = 0.7  # about -3 dB
 
@@ -147,15 +141,12 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings()
         self._separated = False
         self._job: SeparationJob | None = None
-        # Transposition and speed: originals + cached processed versions for the
-        # current track set.
+        # Transposition and speed: played processed in real time (a
+        # StreamSession). The cache holds the originals of the current track
+        # set plus versions rendered offline for Render mix.
         self._transpose_cache: TranspositionCache | None = None
         self._semitones = 0  # applied to the engine
         self._speed = 100  # applied to the engine (percent)
-        self._transpose_job: TransposeJob | None = None
-        # How the playing version is produced: NATIVE = rendered in real time
-        # (a StreamSession), RUBBERBAND = rendered beforehand. None: original.
-        self._applied_engine: str | None = None
         self._stream_error_shown = False
         self._track_generation = 0  # bumps whenever the track set changes
         self._transpose_timer = QTimer(self)
@@ -264,23 +255,6 @@ class MainWindow(QMainWindow):
         self.act_speed_reset = QAction("Reset spee&d", self)
         self.act_speed_reset.setShortcut(QKeySequence("Ctrl+0"))
         self.act_speed_reset.triggered.connect(lambda: self.speed_spin.setValue(100))
-        # Engine for transposition and speed changes.
-        self._engine_group = QActionGroup(self)
-        self._engine_group.setExclusive(True)
-        self._engine_actions: dict[str, QAction] = {}
-        engine = self.settings.stretch_engine
-        if engine == RUBBERBAND and not rubberband_available():
-            engine = NATIVE
-        self._stretch_engine = engine
-        for name in ENGINES:
-            act = QAction(ENGINE_LABELS[name], self, checkable=True)
-            act.setChecked(name == engine)
-            if name == RUBBERBAND and not rubberband_available():
-                act.setEnabled(False)
-                act.setText(f"{ENGINE_LABELS[name]} (not installed)")
-            act.triggered.connect(lambda _checked, n=name: self.set_stretch_engine(n))
-            self._engine_group.addAction(act)
-            self._engine_actions[name] = act
 
         self.act_separate = QAction(
             theme.icon("split"), "&Separate into stems", self)
@@ -357,9 +331,6 @@ class MainWindow(QMainWindow):
         transport_menu.addAction(self.act_speed_up)
         transport_menu.addAction(self.act_speed_down)
         transport_menu.addAction(self.act_speed_reset)
-        engine_menu = transport_menu.addMenu("Pitch/speed &engine")
-        for act in self._engine_actions.values():
-            engine_menu.addAction(act)
         beats_menu = self.menuBar().addMenu("&Beats")
         beats_menu.addAction(self.act_count_in)
         beats_menu.addSeparator()
@@ -451,14 +422,6 @@ class MainWindow(QMainWindow):
         self.sep_cancel.setText("Cancel")
         self.sep_cancel.clicked.connect(self.cancel_separation)
         for w in (self.sep_label, self.sep_progress, self.sep_cancel):
-            self.statusBar().addPermanentWidget(w)
-            w.hide()
-
-        # Transposition / speed change progress.
-        self.tr_label = QLabel()
-        self.tr_progress = QProgressBar()
-        self.tr_progress.setFixedWidth(140)
-        for w in (self.tr_label, self.tr_progress):
             self.statusBar().addPermanentWidget(w)
             w.hide()
 
@@ -612,7 +575,7 @@ class MainWindow(QMainWindow):
         to one file. Asks for the file name unless ``path`` is given."""
         if not self.engine.is_loaded:
             return None
-        if self._transpose_job is not None or (self._semitones, self._speed) != self._target_version():
+        if (self._semitones, self._speed) != self._target_version():
             QMessageBox.information(self, "Transposition in progress",
                                     "Please wait until the transposition or speed change has finished, "
                                     "then render again.")
@@ -648,7 +611,7 @@ class MainWindow(QMainWindow):
         """The tracks as heard. Real-time playback has no rendered audio: the
         song's tracks are rendered now (same processing, offline). None if
         cancelled or failed."""
-        if self._applied_engine != NATIVE or (self._semitones, self._speed) == (0, 100):
+        if (self._semitones, self._speed) == (0, 100):
             return self.engine.tracks
         version = (self._semitones, self._speed)
         datas = self._transpose_cache.get(version)
@@ -664,7 +627,7 @@ class MainWindow(QMainWindow):
     def _render_offline(self, version: tuple[int, int]) -> list | None:
         """Render the song's tracks at ``version`` with a progress dialog."""
         job = TransposeJob(self._transpose_cache.originals, self.engine.sample_rate, *version,
-                           self._track_generation, parent=self, engine=NATIVE)
+                           self._track_generation, parent=self)
         dialog = QProgressDialog("Rendering the transposition and speed change…", "Cancel", 0, 1000, self)
         dialog.setWindowTitle("Render mix")
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
@@ -835,14 +798,14 @@ class MainWindow(QMainWindow):
         return True
 
     # ----- transposition and speed ------------------------------------------
-    # Both are rendered together by one job; "transposition" below covers both.
+    # Both are processed together; "transposition" below covers both.
 
     def _target_version(self) -> tuple[int, int]:
         """(semitones, speed) the controls ask for."""
         return (self.transpose_spin.value(), self.speed_spin.value())
 
     def _set_controls(self, semitones: int, speed: int) -> None:
-        """Set the transpose/speed controls without triggering a render."""
+        """Set the transpose/speed controls without triggering a change."""
         for spin, value in ((self.transpose_spin, semitones), (self.speed_spin, speed)):
             spin.blockSignals(True)
             spin.setValue(value)
@@ -850,64 +813,33 @@ class MainWindow(QMainWindow):
 
     def _reset_transposition(self, keep_value: bool) -> None:
         """New track set loaded at original pitch and tempo: start over,
-        re-rendering the current transposition and speed for the new tracks if
+        applying the current transposition and speed to the new tracks if
         they should be kept."""
-        self._cancel_transpose_job()
         self._track_generation += 1
         self._transpose_cache = TranspositionCache([(t.name, t.data) for t in self.engine.tracks if t.is_audio])
         self._semitones, self._speed = 0, 100
-        self._applied_engine = None
         if not keep_value:
             self._set_controls(0, 100)
         self._apply_transpose()
 
     def _on_transpose_value_changed(self, _value: int) -> None:
         self._set_dirty(True)
-        self._transpose_timer.setInterval(
-            REALTIME_DEBOUNCE_MS if self._stretch_engine == NATIVE else TRANSPOSE_DEBOUNCE_MS)
         self._transpose_timer.start()  # (re)start the debounce
 
     def _apply_transpose(self) -> None:
         self._transpose_timer.stop()
         target = self._target_version()
-        cache = self._transpose_cache
-        if cache is None:
-            return
-        if self._stretch_engine == NATIVE:
-            self._cancel_transpose_job()
-            if target != (self._semitones, self._speed) or (
-                    target != (0, 100) and self._applied_engine != NATIVE):
-                self._apply_realtime(target)
-            return
-        job = self._transpose_job
-        if job is not None and job.version == target and job.generation == self._track_generation:
-            return  # already rendering this
-        self._cancel_transpose_job()
-        datas = cache.get(target)
-        if datas is not None:
-            if target != (self._semitones, self._speed):
-                self._apply_version(target, datas)
-            self._update_transpose_status()
-            return
-        job = TransposeJob(cache.originals, self.engine.sample_rate, *target, self._track_generation, parent=self,
-                           engine=self._stretch_engine)
-        job.progress.connect(self._on_transpose_progress)
-        job.finished.connect(self._on_transpose_finished)
-        job.failed.connect(self._on_transpose_failed)
-        job.done.connect(job.deleteLater)
-        self._transpose_job = job
-        job.start()
-        self._on_transpose_progress(0.0)
+        if self._transpose_cache is not None and target != (self._semitones, self._speed):
+            self._apply_realtime(target)
 
-    def _apply_version(self, version: tuple[int, int], datas: list) -> None:
-        self._swap_audio(datas, speed=version[1])
-        self._semitones, self._speed = version
-        self._applied_engine = None if version == (0, 100) else RUBBERBAND
+    def _apply_original(self) -> None:
+        self._swap_audio([d for _, d in self._transpose_cache.originals], speed=100)
+        self._semitones, self._speed = 0, 100
 
     def _apply_realtime(self, version: tuple[int, int]) -> None:
         """Play ``version`` processed in real time (the original: no processing)."""
         if version == (0, 100):
-            self._apply_version(version, [d for _, d in self._transpose_cache.originals])
+            self._apply_original()
             return
         semitones, speed = version
         start = int(round(self.engine.position * self.engine.sample_rate * 100 / speed))
@@ -916,7 +848,6 @@ class MainWindow(QMainWindow):
         others = [None if t.is_audio else d for t, d in zip(self.engine.tracks, self._other_audio(speed))]
         self.engine.set_stream(session, speed / 100, others)
         self._semitones, self._speed = version
-        self._applied_engine = NATIVE
         self._stream_error_shown = False
 
     def _other_audio(self, speed: int) -> list:
@@ -939,54 +870,11 @@ class MainWindow(QMainWindow):
         new = [next(it) if t.is_audio else d for t, d in zip(self.engine.tracks, self._other_audio(speed))]
         self.engine.swap_audio(new, speed / 100)
 
-    def _cancel_transpose_job(self) -> None:
-        if self._transpose_job is not None:
-            self._transpose_job.cancel()  # it deletes itself when its thread ends
-            self._transpose_job = None
-        self._update_transpose_status()
-
-    def _on_transpose_progress(self, _fraction: float) -> None:
-        job = self._transpose_job
-        if job is None:
-            return
-        parts = [f"{job.semitones:+d} st" if job.semitones else "", f"{job.speed}%" if job.speed != 100 else ""]
-        self.tr_label.setText(f"Rendering {', '.join(p for p in parts if p) or 'original'}…")
-        # Rubber Band only reports finished tracks, and they render in parallel
-        # and finish together: a percentage would sit at 0% then jump.
-        # (The built-in engine plays in real time: no job.)
-        self.tr_progress.setRange(0, 0)
-        self.tr_label.show()
-        self.tr_progress.show()
-
-    def _on_transpose_finished(self, version: tuple[int, int], datas: list) -> None:
-        job = self.sender()
-        if job is not self._transpose_job or job.generation != self._track_generation:
-            return  # stale result for an old track set
-        self._transpose_job = None
-        self._transpose_cache.put(version, datas)
-        if version == self._target_version():
-            self._apply_version(version, datas)
-        self._update_transpose_status()
-        self._apply_transpose()  # in case the target moved on meanwhile
-
-    def _on_transpose_failed(self, message: str) -> None:
-        if self.sender() is not self._transpose_job:
-            return
-        self._transpose_job = None
-        self._update_transpose_status()
-        self._set_controls(self._semitones, self._speed)  # back to what's playing
-        QMessageBox.warning(self, "Transpose failed", message)
-
     def _on_realtime_failed(self, message: str) -> None:
         """Real-time processing stopped: back to the original audio."""
         self._set_controls(0, 100)
-        self._apply_version((0, 100), [d for _, d in self._transpose_cache.originals])
+        self._apply_original()
         QMessageBox.warning(self, "Transpose failed", message)
-
-    def _update_transpose_status(self) -> None:
-        if self._transpose_job is None:
-            self.tr_label.hide()
-            self.tr_progress.hide()
 
     # ----- separation ----------------------------------------------------
 
@@ -1344,23 +1232,6 @@ class MainWindow(QMainWindow):
         # The count-in plays even if the metronome track is muted (that's the point).
         self.engine.play_with_count_in(ci.audio * max(gain, 0.3), ci.start * s)
 
-    def set_stretch_engine(self, engine: str) -> None:
-        """Switch the transposition/speed engine; the current version is
-        re-rendered with it (versions rendered by the other engine are dropped)."""
-        if engine == self._stretch_engine:
-            return
-        self._stretch_engine = engine
-        self.settings.stretch_engine = engine
-        self._engine_actions[engine].setChecked(True)
-        if self._transpose_cache is None:
-            return
-        # A job still running belongs to the old engine: its result is ignored
-        # once it's no longer the current job. The old engine's audio keeps
-        # playing until the new rendering is ready.
-        self._cancel_transpose_job()
-        self._transpose_cache = TranspositionCache(self._transpose_cache.originals)
-        self._apply_transpose()
-
     def _on_count_in_toggled(self, on: bool) -> None:
         self.settings.count_in = on
 
@@ -1452,10 +1323,6 @@ class MainWindow(QMainWindow):
             self._model_task.wait(1)  # a network call; don't block closing for long
         self.cancel_separation()
         self._cancel_beats_job()
-        job = self._transpose_job
-        self._cancel_transpose_job()
-        if job is not None:
-            job.wait(2)
         self._timer.stop()
         self.engine.close()
         super().closeEvent(event)

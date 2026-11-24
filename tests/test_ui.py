@@ -262,10 +262,6 @@ def stems_window(tmp_path, seconds=2.0):
     return win, path
 
 
-needs_rubberband = pytest.mark.skipif(not __import__("shutil").which("rubberband"), reason="no rubberband")
-ENGINES = ["native", pytest.param("rubberband", marks=needs_rubberband)]
-
-
 def heard(win, seconds=0.5):
     """Play ``seconds`` from the current position (paced like a sound card) and return the audio."""
     import time
@@ -280,54 +276,20 @@ def heard(win, seconds=0.5):
     return np.concatenate(out)
 
 
-@needs_rubberband
-def test_transpose_applies_and_caches(qapp, tmp_path):
-    win, _ = stems_window(tmp_path)
-    win.set_stretch_engine("rubberband")  # rendered versions (the built-in engine plays in real time)
-    originals = [t.data for t in win.engine.tracks]
-    win._lanes[0].mute_button.click()
-    win.timeline.set_loop(0.5, 1.5, enabled=True)
-    win.engine.seek(0.7)
-
-    win.transpose_spin.setValue(3)
-    assert win.semitones == 0  # debounced, rendering in background
-    wait_until(qapp, lambda: win.semitones == 3)
-    assert not any(np.shares_memory(t.data, o) for t, o in zip(win.engine.tracks, originals))
-    assert win.engine.tracks[0].mute and win.engine.loop_active
-    assert win.engine.position == pytest.approx(0.7, abs=0.01)
-    assert not win.tr_progress.isVisible()
-
-    # Back to 0 and again to +3: both cached, applied without a job.
-    for value in (0, 3):
-        win.transpose_spin.setValue(value)
-        win._apply_transpose()  # skip the debounce wait
-        assert win._transpose_job is None and win.semitones == value
-    assert not any(np.shares_memory(t.data, o) for t, o in zip(win.engine.tracks, originals))
-    win.act_transpose_reset.trigger()
-    win._apply_transpose()
-    assert all(np.shares_memory(t.data, o) for t, o in zip(win.engine.tracks, originals))
-    win.close()
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-def test_rapid_changes_only_render_final_value(qapp, tmp_path, monkeypatch, engine):
+def test_rapid_changes_only_render_final_value(qapp, tmp_path, monkeypatch):
     from backing_track_generator.ui import main_window
 
     sessions = []
     real = main_window.StreamSession
     monkeypatch.setattr(main_window, "StreamSession", lambda *a, **k: sessions.append(real(*a, **k)) or sessions[-1])
     win, _ = stems_window(tmp_path)
-    win.set_stretch_engine(engine)
     for _ in range(4):
         win.act_transpose_down.trigger()
     assert win.transpose_spin.value() == -4
-    assert win._transpose_job is None and win.semitones == 0  # debounce: nothing started yet
+    assert win.semitones == 0  # debounce: nothing started yet
     wait_until(qapp, lambda: win.semitones == -4)
-    if engine == "rubberband":
-        assert win._transpose_cache.cached() == [(0, 100), (-4, 100)]
-    else:
-        assert [s.version for s in sessions] == [(-4, 100)]
-        assert win.engine.stream_session is sessions[0]
+    assert [s.version for s in sessions] == [(-4, 100)]
+    assert win.engine.stream_session is sessions[0]
     win.close()
 
 
@@ -343,7 +305,7 @@ def test_transpose_survives_stem_swap_and_resets_on_new_file(qapp, tmp_path):
     win.start_separation()  # stems arrive at original pitch -> re-rendered at +2
     assert [t.name for t in win.engine.tracks] == ["bass"]
     assert win.transpose_spin.value() == 2
-    wait_until(qapp, lambda: win.semitones == 2 and win._transpose_job is None)
+    wait_until(qapp, lambda: win.semitones == 2)
     assert win._transpose_cache.originals[0][0] == "bass"
 
     other = tmp_path / "other"
@@ -353,33 +315,24 @@ def test_transpose_survives_stem_swap_and_resets_on_new_file(qapp, tmp_path):
     win.close()
 
 
-def make_engine_fail(engine, tmp_path, monkeypatch):
-    """Make the given transposition engine fail with the message "nope"."""
-    if engine == "native":
-        from backing_track_generator import stretch
+def make_engine_fail(monkeypatch):
+    """Make real-time transposition fail with the message "nope"."""
+    from backing_track_generator import stretch
 
-        def nope(*args, **kwargs):
-            raise RuntimeError("nope")
+    def nope(*args, **kwargs):
+        raise RuntimeError("nope")
 
-        monkeypatch.setattr(stretch.StreamShifter, "read", nope)  # real-time rendering fails
-        return
-    fake = tmp_path / "bin" / "rubberband"
-    fake.parent.mkdir()
-    fake.write_text("#!/bin/sh\necho nope >&2\nexit 1\n")
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", str(fake.parent))
+    monkeypatch.setattr(stretch.StreamShifter, "read", nope)
 
 
-@pytest.mark.parametrize("engine", ["native", "rubberband"])
-def test_transpose_failure_reverts_value(qapp, tmp_path, monkeypatch, engine):
+def test_transpose_failure_reverts_value(qapp, tmp_path, monkeypatch):
     from backing_track_generator.ui import main_window
 
     warnings = []
     monkeypatch.setattr(main_window.QMessageBox, "warning", lambda *a: warnings.append(a[2]))
-    make_engine_fail(engine, tmp_path, monkeypatch)
+    make_engine_fail(monkeypatch)
 
     win = make_window()
-    win.set_stretch_engine(engine)
     win.open_file(make_song(tmp_path), separate=False)
     win.transpose_spin.setValue(5)
     win._apply_transpose()
@@ -565,8 +518,7 @@ def test_render_audible_tracks_and_loop(qapp, tmp_path, monkeypatch):
     win.close()
 
 
-@pytest.mark.parametrize("engine", ENGINES)
-def test_render_uses_current_transposition_and_waits_for_it(qapp, tmp_path, monkeypatch, engine):
+def test_render_uses_current_transposition_and_waits_for_it(qapp, tmp_path, monkeypatch):
     from PySide6.QtWidgets import QMessageBox
 
     from backing_track_generator.audio_io import load_audio
@@ -575,7 +527,6 @@ def test_render_uses_current_transposition_and_waits_for_it(qapp, tmp_path, monk
     infos = []
     monkeypatch.setattr(QMessageBox, "information", lambda *a: infos.append(a[1]))
     win, _ = stems_window(tmp_path)
-    win.set_stretch_engine(engine)
     win.transpose_spin.setValue(4)
     assert win.render_to_file(path=tmp_path / "early.wav") is None  # still pending
     assert infos == ["Transposition in progress"] and not (tmp_path / "early.wav").exists()
@@ -583,10 +534,8 @@ def test_render_uses_current_transposition_and_waits_for_it(qapp, tmp_path, monk
     wait_until(qapp, lambda: win.semitones == 4)
     path = win.render_to_file(path=tmp_path / "t.wav")
     data, _ = load_audio(path)
-    if engine == "rubberband":
-        expected = sum(t.data for t in win.engine.tracks)  # what plays
-    else:  # rendered offline with the same processing as the real-time playback
-        expected = sum(transpose_tracks(win._transpose_cache.originals, 44100, 4))
+    # Rendered offline with the same processing as the real-time playback.
+    expected = sum(transpose_tracks(win._transpose_cache.originals, 44100, 4))
     np.testing.assert_allclose(data, expected, atol=1e-4)
     win.close()
 
@@ -1175,13 +1124,10 @@ def test_project_keeps_unmuted_metronome(qapp, tmp_path, dialogs):
 
 # ----- speed -------------------------------------------------------------------------
 
-@pytest.mark.parametrize("engine", ENGINES)
-def test_speed_change_keeps_song_time_and_renders_stretched(qapp, tmp_path, dialogs, engine):
+def test_speed_change_keeps_song_time_and_renders_stretched(qapp, tmp_path, dialogs):
     from backing_track_generator.audio_io import load_audio
-    from backing_track_generator.ui.settings import AppSettings
 
     win, _ = stems_window(tmp_path)
-    win.set_stretch_engine(engine)
     win.timeline.set_loop(0.5, 1.5, enabled=True)
     win.engine.seek(0.7)
     win.act_speed_down.trigger()
@@ -1203,16 +1149,12 @@ def test_speed_change_keeps_song_time_and_renders_stretched(qapp, tmp_path, dial
     win.transpose_spin.setValue(-2)
     wait_until(qapp, lambda: win.semitones == -2)
     assert win.speed == 90
-    if engine == "rubberband":
-        assert win._transpose_cache.cached()[-1] == (-2, 90)
-    else:
-        assert win.engine.stream_session.version == (-2, 90)
+    assert win.engine.stream_session.version == (-2, 90)
     dialogs["save_path"] = tmp_path / "proj"
     assert win.save_project_as()
     win.close()
 
     win2 = make_window()
-    assert AppSettings().stretch_engine == engine  # remembered
     assert win2.open_project(tmp_path / "proj")
     assert win2.speed_spin.value() == 90 and win2.transpose_spin.value() == -2
     assert all(d.shape[0] == 88200 for _, d in win2._transpose_cache.originals)  # saved at original tempo
@@ -1228,7 +1170,7 @@ def test_speed_regenerates_metronome_and_count_in(qapp, tmp_path):
     win = make_window()
     win.open_file(beats_song(tmp_path))
     datas = [d for _, d in win._transpose_cache.originals]
-    # Stand-in for Rubber Band's output at 80 %.
+    # Stand-in for audio processed offline at 80 %.
     win._swap_audio([np.zeros((round(d.shape[0] / 0.8), 2), np.float32) for d in datas], speed=80)
     win._speed = 80
     click = win.engine.tracks[2].data[:, 0]
@@ -1251,66 +1193,19 @@ def test_speed_regenerates_metronome_and_count_in(qapp, tmp_path):
     win.close()
 
 
-@pytest.mark.parametrize("engine", ["native", "rubberband"])
-def test_speed_failure_reverts_value(qapp, tmp_path, monkeypatch, engine):
+def test_speed_failure_reverts_value(qapp, tmp_path, monkeypatch):
     from backing_track_generator.ui import main_window
 
     warnings = []
     monkeypatch.setattr(main_window.QMessageBox, "warning", lambda *a: warnings.append(a[2]))
-    make_engine_fail(engine, tmp_path, monkeypatch)
+    make_engine_fail(monkeypatch)
 
     win = make_window()
-    win.set_stretch_engine(engine)
     win.open_file(make_song(tmp_path), separate=False)
     win.speed_spin.setValue(120)
     win._apply_transpose()
     wait_until(qapp, lambda: warnings)
     assert win.speed_spin.value() == 100 and win.speed == 100
-    win.close()
-
-
-# ----- transposition engine --------------------------------------------------------
-
-
-def test_engine_menu_switches_and_persists(qapp, tmp_path, monkeypatch):
-    from backing_track_generator.ui.settings import AppSettings
-
-    monkeypatch.setattr("backing_track_generator.ui.main_window.rubberband_available", lambda: True)
-    win, _ = stems_window(tmp_path)
-    assert win._stretch_engine == "native" and win._engine_actions["native"].isChecked()
-    win.transpose_spin.setValue(2)
-    win._apply_transpose()
-    session = win.engine.stream_session
-    assert win.semitones == 2 and session is not None and session.version == (2, 100)  # real time: no job
-    assert win._transpose_job is None
-
-    # Rubber Band renders beforehand (faked here with the built-in offline rendering).
-    calls = []
-    import backing_track_generator.ui.transpose_job as tj
-    real = tj.transpose_tracks
-    monkeypatch.setattr(tj, "transpose_tracks", lambda *a, **k: calls.append(k["engine"]) or real(*a, **{**k, "engine": "native"}))
-    win._engine_actions["rubberband"].trigger()
-    assert AppSettings().stretch_engine == "rubberband" and win._engine_actions["rubberband"].isChecked()
-    # The real-time audio keeps playing while Rubber Band renders...
-    assert win.engine.stream_session is session and win._transpose_job.engine == "rubberband"
-    wait_until(qapp, lambda: win._transpose_job is None)
-    assert calls == ["rubberband"]
-    assert win.engine.stream_session is None and session.closed  # ...then is replaced
-
-    win._engine_actions["native"].trigger()  # and back to real time
-    assert win.engine.stream_session is not None and win.engine.stream_session.version == (2, 100)
-    win.close()
-
-
-def test_rubberband_menu_entry_disabled_when_not_installed(qapp, tmp_path, monkeypatch):
-    from backing_track_generator.ui.settings import AppSettings
-
-    AppSettings().stretch_engine = "rubberband"
-    monkeypatch.setattr("backing_track_generator.ui.main_window.rubberband_available", lambda: False)
-    win = make_window()
-    assert win._stretch_engine == "native"  # falls back
-    assert not win._engine_actions["rubberband"].isEnabled()
-    assert win._engine_actions["native"].isChecked()
     win.close()
 
 
