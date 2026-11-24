@@ -1,6 +1,7 @@
 # Windows checks on real Windows: the test suite from source, and the installer
 # (built on Linux exactly as packaging/windows/build.sh does locally) installed,
-# tested, started and uninstalled.
+# tested, started and uninstalled. Pushing a version tag (v1.2.3) also publishes
+# the installer as a GitHub Release, once all the checks have passed.
 name: Windows
 
 on:
@@ -110,3 +111,36 @@ jobs:
           $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Backing Track Generator.lnk'
           if (Test-Path $lnk) { throw "Start menu shortcut left behind" }
           if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BackingTrackGenerator') { throw "uninstall entry left behind" }
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [tests-from-source, test-installer]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write  # create the release and upload the installer
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: windows-installer
+          path: dist
+      - name: Check that the tag matches the app version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $version in pyproject.toml"
+            exit 1
+          fi
+          ls dist/BackingTrackGenerator-$version-Setup.exe
+      - name: Create the release (or update its installer when re-run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*-Setup.exe --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*-Setup.exe \
+              --title "Backing Track Generator ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag
+          fi

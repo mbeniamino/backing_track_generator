@@ -113,6 +113,11 @@ The installer (~130 MB) installs per user, without administrator rights, into
 an optional desktop one. `/S` installs silently. Uninstalling keeps the separated
 stems, settings and downloaded models.
 
+On GitHub, the `Windows` workflow builds the installer on every push (download it
+from the run's Artifacts) and tests it on Windows: installed, test suite, start,
+uninstall. Pushing a tag `v<version>` matching `pyproject.toml` (e.g. `v0.1.0`)
+also publishes the installer as a GitHub Release once all checks pass.
+
 Testing under Wine: use a separate `WINEPREFIX`, and set
 `WINEDLLOVERRIDES=winemenubuilder.exe=d` so the shortcuts don't end up in your Linux
 menu and desktop. The test suite can run on the installed Python
