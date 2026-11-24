@@ -1,0 +1,112 @@
+# Windows checks on real Windows: the test suite from source, and the installer
+# (built on Linux exactly as packaging/windows/build.sh does locally) installed,
+# tested, started and uninstalled.
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  QT_QPA_PLATFORM: offscreen  # no display on the runners
+
+jobs:
+  tests-from-source:
+    name: Tests from source (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --locked
+      - run: uv run pytest -q -rs
+
+  build-installer:
+    name: Build installer (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - name: Install NSIS and Qt's runtime libraries (for drawing the icon)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nsis libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+      - run: packaging/windows/build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer
+          path: build/windows/*-Setup.exe
+          if-no-files-found: error
+          compression-level: 0  # already LZMA-compressed
+
+  test-installer:
+    name: Install, test, uninstall (Windows)
+    needs: build-installer
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: windows-installer
+          path: dist
+
+      - name: Install silently
+        run: |
+          $setup = Get-ChildItem dist\*-Setup.exe | Select-Object -First 1
+          $p = Start-Process $setup.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exit code $($p.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Backing Track Generator'
+          "INSTDIR=$dir" >> $env:GITHUB_ENV
+          foreach ($f in 'python\pythonw.exe', 'app.ico', 'uninstall.exe') {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "missing $f" }
+          }
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Backing Track Generator.lnk'
+          if (-not (Test-Path $lnk)) { throw "no Start menu shortcut" }
+
+      - name: Test suite on the installed Python (including the slow tests)
+        env:
+          RUN_SLOW: '1'
+        run: |
+          $py = Join-Path $env:INSTDIR 'python\python.exe'
+          # The installed Python has no pip: put pytest in a side folder on sys.path.
+          uv pip install --quiet --target "$env:RUNNER_TEMP\pytest-site" --python-version 3.13 `
+            --python-platform x86_64-pc-windows-msvc --only-binary :all: pytest
+          & $py -c "import sys; sys.path.append(sys.argv[1]); import pytest; sys.exit(pytest.main(['-q', '-rs', '-p', 'no:cacheprovider', 'tests']))" "$env:RUNNER_TEMP\pytest-site"
+          if ($LASTEXITCODE -ne 0) { throw "tests failed" }
+
+      - name: Start the app without a console, as the shortcut does
+        run: |
+          $report = "$env:RUNNER_TEMP\gui-report.txt"
+          $pyw = Join-Path $env:INSTDIR 'python\pythonw.exe'
+          $p = Start-Process $pyw -ArgumentList 'packaging\windows\gui_smoke.py', $report -Wait -PassThru
+          if (-not (Test-Path $report)) { throw "the app did not get to show its window (exit code $($p.ExitCode))" }
+          Get-Content $report
+          $r = Get-Content $report -Raw
+          if ($r -notmatch 'visible=True') { throw "window not visible" }
+          if ($r -notmatch 'stdout=nul') { throw "stdout fallback for pythonw not active" }
+          if ($r -notmatch [regex]::Escape("config=$env:APPDATA\backing-track-generator")) { throw "wrong settings folder" }
+          if ($r -notmatch [regex]::Escape("cache=$env:LOCALAPPDATA\backing-track-generator")) { throw "wrong cache folder" }
+
+      - name: Uninstall silently
+        run: |
+          # The NSIS uninstaller copies itself to %TEMP% and returns at once: wait for it.
+          Start-Process (Join-Path $env:INSTDIR 'uninstall.exe') -ArgumentList '/S' -Wait
+          for ($i = 0; $i -lt 60 -and (Test-Path $env:INSTDIR); $i++) { Start-Sleep 1 }
+          if (Test-Path $env:INSTDIR) { Get-ChildItem -Recurse $env:INSTDIR | Select-Object -First 20; throw "install folder left behind" }
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Backing Track Generator.lnk'
+          if (Test-Path $lnk) { throw "Start menu shortcut left behind" }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BackingTrackGenerator') { throw "uninstall entry left behind" }
