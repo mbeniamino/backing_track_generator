@@ -234,6 +234,7 @@ class MainWindow(QMainWindow):
         self.act_loop_out.setShortcut(Qt.Key.Key_BracketRight)
         self.act_loop_out.triggered.connect(self.set_loop_end_here)
         self.act_loop_clear = QAction("&Clear loop", self)
+        self.act_loop_clear.setShortcut("Shift+L")
         self.act_loop_clear.triggered.connect(self.timeline.clear_loop)
 
         self.act_transpose_up = QAction("Transpose &up", self)
