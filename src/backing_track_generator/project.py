@@ -132,13 +132,13 @@ def save_project(directory: str | Path, settings: ProjectSettings, datas: list[n
         with ThreadPoolExecutor(max_workers=max(len(datas), 1)) as pool:
             gains = list(pool.map(lambda nd: write_flac(tmp / TRACKS_DIR / nd[0], nd[1], settings.sample_rate),
                                   zip(names, datas)))
-        (tmp / PROJECT_FILE).write_text(_settings_json(settings, list(zip(names, gains))))
+        (tmp / PROJECT_FILE).write_text(_settings_json(settings, list(zip(names, gains))), encoding="utf-8")
     return directory
 
 
 def _read_json(path: Path) -> dict:
     try:
-        doc = json.loads(path.read_text())
+        doc = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise ProjectError(f"No project found at {path}") from None
     except (OSError, ValueError) as e:

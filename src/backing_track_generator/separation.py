@@ -17,6 +17,7 @@ from typing import Callable
 import numpy as np
 
 from .audio_io import load_audio, load_audio_scaled, write_flac
+from . import paths
 from .fsutil import staged_dir
 
 DEFAULT_MODEL = "htdemucs_6s"  # vocals, drums, bass, guitar, piano, other
@@ -43,8 +44,7 @@ class Stem:
 # ----- cache ---------------------------------------------------------------
 
 def cache_root() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
-    return Path(base) / "backing-track-generator" / "stems"
+    return paths.cache_dir() / "stems"
 
 
 def file_digest(path: str | Path) -> str:
@@ -84,12 +84,12 @@ def write_stems(stem_dir: Path, stems: list[Stem], sample_rate: int, source: str
             "sample_rate": sample_rate,
             "stems": entries,
         }
-        (tmp / MANIFEST).write_text(json.dumps(manifest, indent=2))
+        (tmp / MANIFEST).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
 def load_stems(stem_dir: Path) -> tuple[list[Stem], int]:
     """Load cached stems, sorted in display order."""
-    manifest = json.loads((stem_dir / MANIFEST).read_text())
+    manifest = json.loads((stem_dir / MANIFEST).read_text(encoding="utf-8"))
     try:
         os.utime(stem_dir / MANIFEST)  # record "last used" for cache management
     except OSError:
@@ -260,7 +260,7 @@ def run_beats_worker(audio_paths: list[str], gains: list[float], out_file: str, 
 
 def stem_files(stem_dir: Path) -> tuple[list[str], list[float]]:
     """Paths and gains of a cached separation's stems (for the beats worker)."""
-    manifest = json.loads((stem_dir / MANIFEST).read_text())
+    manifest = json.loads((stem_dir / MANIFEST).read_text(encoding="utf-8"))
     return ([str(stem_dir / e["file"]) for e in manifest["stems"]],
             [float(e.get("gain", 1.0)) for e in manifest["stems"]])
 

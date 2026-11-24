@@ -26,6 +26,10 @@ saves the result as a project or renders it to a single audio file.
 
   On Arch Linux: `pacman -S ffmpeg portaudio`
 
+  On Windows nothing extra is needed: PortAudio comes with the Python packages, and
+  WAV, FLAC, MP3 and Ogg open without ffmpeg (put `ffmpeg.exe` on the `PATH` for
+  other formats).
+
 The first `uv sync` downloads PyTorch (CPU-only build, ~1 GB).
 
 ## Running
@@ -67,6 +71,7 @@ mix would clip, it is lowered as a whole instead (the status bar says by how muc
 - **Projects** are folders: `project.json` (settings) plus `tracks/*.flac`
   (24-bit, original pitch; usable on their own).
 - **Separated stems** are cached in `~/.cache/backing-track-generator/stems/`
+  (Windows: `%LOCALAPPDATA%\backing-track-generator\stems\`)
   (about 100–150 MB per song), so reopening a song is instant. Tracks → Manage
   cache lists them (size, last used) and deletes the ones you no longer need.
   The cache has a size limit (5 GB by default, changeable there, or "No limit"):
@@ -75,7 +80,8 @@ mix would clip, it is lowered as a whole instead (the status bar says by how muc
 - **Beats** are detected once per song (a few seconds) and stored with the cached
   stems (`beats.json`) and in projects, together with your corrections. The
   beat model is downloaded on first use into `~/.cache/torch/hub/checkpoints/`.
-- **Settings** are stored in `~/.config/backing-track-generator/settings.ini`.
+- **Settings** are stored in `~/.config/backing-track-generator/settings.ini`
+  (Windows: `%APPDATA%\backing-track-generator\settings.ini`).
 - **The separation model** lives in the Hugging Face cache (`~/.cache/huggingface/`).
   Tracks → Check for separation model updates downloads a newer version on request;
   Manage cache removes the older versions.

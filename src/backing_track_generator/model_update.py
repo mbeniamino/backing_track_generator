@@ -98,7 +98,7 @@ def check_for_update(model: str) -> ModelUpdateInfo:
 
     changed: list[str] = []
     size = 0
-    for filename in _needed_files(model, local_yaml.read_text()):
+    for filename in _needed_files(model, local_yaml.read_text(encoding="utf-8")):
         sibling = remote.get(filename)
         local = _cached(repo_id, filename)
         if sibling is None:
@@ -131,7 +131,7 @@ def download_latest(model: str) -> str:
     repo_id = repo_id_for(model)
     try:
         yaml_path = Path(hf_hub_download(repo_id, f"{model}.yaml"))
-        for filename in _needed_files(model, yaml_path.read_text())[1:]:
+        for filename in _needed_files(model, yaml_path.read_text(encoding="utf-8"))[1:]:
             hf_hub_download(repo_id, filename)
     except Exception as e:
         raise ModelUpdateError(f"Could not download {repo_id}: {e}") from e

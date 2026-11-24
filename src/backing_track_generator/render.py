@@ -11,6 +11,7 @@ import numpy as np
 import soundfile as sf
 
 from .engine import CHANNELS, Track, audible_tracks
+from .fsutil import replace
 
 # Extension -> soundfile write arguments.
 FORMATS: dict[str, dict] = {
@@ -85,7 +86,7 @@ def render_mix(tracks: list[Track], sample_rate: int, path: str | Path,
     os.close(fd)
     try:
         sf.write(tmp, data, sample_rate, **fmt)
-        os.replace(tmp, path)
+        replace(tmp, path)
     except Exception as e:
         Path(tmp).unlink(missing_ok=True)
         raise RenderError(f"Could not write {path.name}: {e}") from e

@@ -49,7 +49,9 @@ def to_stereo(data: np.ndarray) -> np.ndarray:
 
 def _decode_with_ffmpeg(path: Path) -> tuple[np.ndarray, int]:
     if shutil.which("ffmpeg") is None:
-        raise AudioLoadError(f"Unsupported format and ffmpeg not found: {path.name}")
+        raise AudioLoadError(
+            f"Can't open {path.name}: this format needs ffmpeg, which isn't installed. "
+            "WAV, FLAC, MP3 and Ogg files open without it.")
     cmd = [
         "ffmpeg", "-v", "error", "-nostdin", "-i", str(path),
         "-f", "f32le", "-ac", "2", "-ar", str(FFMPEG_SAMPLE_RATE), "-",

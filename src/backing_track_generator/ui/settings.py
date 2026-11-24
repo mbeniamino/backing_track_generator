@@ -1,11 +1,12 @@
-"""Persistent app settings in $XDG_CONFIG_HOME/backing-track-generator/settings.ini."""
+"""Persistent app settings in settings.ini under ``paths.config_dir()``."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from PySide6.QtCore import QSettings
+
+from ..paths import config_dir
 
 GB = 1024 ** 3
 DEFAULT_CACHE_LIMIT = 5 * GB
@@ -14,8 +15,7 @@ CACHE_LIMIT_CHOICES: list[int | None] = [None, 1 * GB, 2 * GB, 5 * GB, 10 * GB, 
 
 
 def settings_path() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
-    return Path(base) / "backing-track-generator" / "settings.ini"
+    return config_dir() / "settings.ini"
 
 
 class AppSettings:

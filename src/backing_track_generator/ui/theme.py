@@ -71,11 +71,11 @@ QToolButton:pressed {{ background: {BORDER.name()}; }}
 QToolButton:checked {{ background: {rgba(LOOP, 50)}; border-color: {LOOP.name()}; }}
 QToolButton:disabled {{ opacity: 0.4; }}
 
-QLabel#timeDisplay {{ font-family: "JetBrains Mono", "Fira Code", "DejaVu Sans Mono", monospace;
+QLabel#timeDisplay {{ font-family: "JetBrains Mono", "Fira Code", "DejaVu Sans Mono", "Cascadia Mono", Consolas, monospace;
     font-size: 20pt; font-weight: 600; color: {TEXT.name()}; background: #0b0c10;
     border: 1px solid {BORDER.name()}; border-radius: 8px; padding: 2px 12px; }}
-QLabel#loopDisplay {{ font-family: monospace; color: {LOOP.name()}; padding: 0 6px; }}
-QLabel#beatDisplay {{ font-family: monospace; color: {TEXT.name()}; padding: 0 6px; }}
+QLabel#loopDisplay {{ font-family: "DejaVu Sans Mono", Consolas, monospace; color: {LOOP.name()}; padding: 0 6px; }}
+QLabel#beatDisplay {{ font-family: "DejaVu Sans Mono", Consolas, monospace; color: {TEXT.name()}; padding: 0 6px; }}
 QLabel#toolbarCaption {{ color: {TEXT_DIM.name()}; font-size: 8pt; font-weight: 600;
     letter-spacing: 1px; padding-left: 4px; }}
 QLabel#placeholder {{ color: {TEXT_DIM.name()}; font-size: 15pt; }}

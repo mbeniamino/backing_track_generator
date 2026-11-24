@@ -41,7 +41,7 @@ def list_cached_songs(root: Path | None = None) -> list[CachedSong]:
         if d.name.startswith(".") or not manifest.is_file():
             continue
         try:
-            meta = json.loads(manifest.read_text())
+            meta = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             meta = {}
         songs.append(CachedSong(

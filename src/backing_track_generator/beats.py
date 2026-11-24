@@ -14,6 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .fsutil import replace
+
 BEATS_FILE = "beats.json"
 BEATS_VERSION = 1
 DETECTOR = "beat_this/final0"
@@ -206,13 +208,13 @@ def detect_beats(mix: np.ndarray, sample_rate: int) -> BeatGrid:
 def write_beats_file(path: Path, grid: BeatGrid) -> None:
     doc = {"version": BEATS_VERSION, "detector": DETECTOR, **grid.to_dict()}
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(doc))
-    tmp.replace(path)
+    tmp.write_text(json.dumps(doc), encoding="utf-8")
+    replace(tmp, path)
 
 
 def read_beats_file(path: Path) -> BeatGrid | None:
     try:
-        doc = json.loads(path.read_text())
+        doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(doc, dict) or doc.get("version", 0) > BEATS_VERSION:
