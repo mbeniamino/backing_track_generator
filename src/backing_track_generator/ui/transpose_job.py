@@ -1,7 +1,8 @@
 """Runs transposition / tempo change in a background thread and relays results as Qt signals.
 
-The heavy lifting happens in ``rubberband`` subprocesses, so a Python thread
-(rather than a process) is enough to keep the GUI responsive.
+The heavy lifting happens in numpy (which releases the GIL) or in
+``rubberband`` subprocesses, so a Python thread (rather than a process) is
+enough to keep the GUI responsive.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import threading
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
-from ..transpose import Cancelled, transpose_tracks
+from ..transpose import DEFAULT_ENGINE, Cancelled, transpose_tracks
 
 
 class TransposeJob(QObject):
@@ -21,13 +22,14 @@ class TransposeJob(QObject):
     done = Signal()  # always emitted last (after finished/failed, or on cancel)
 
     def __init__(self, tracks: list[tuple[str, np.ndarray]], sample_rate: int, semitones: int,
-                 speed: int, generation: int, parent: QObject | None = None):
+                 speed: int, generation: int, parent: QObject | None = None, engine: str = DEFAULT_ENGINE):
         super().__init__(parent)
         self.tracks = tracks
         self.sample_rate = sample_rate
         self.semitones = semitones
         self.speed = speed
         self.generation = generation  # which track set this job belongs to
+        self.engine = engine
         self._cancel = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -51,7 +53,7 @@ class TransposeJob(QObject):
     def _run(self) -> None:
         try:
             datas = transpose_tracks(self.tracks, self.sample_rate, self.semitones, self.speed,
-                                     progress=self.progress.emit, cancel=self._cancel)
+                                     progress=self.progress.emit, cancel=self._cancel, engine=self.engine)
         except Cancelled:
             pass
         except Exception as e:  # report everything to the GUI

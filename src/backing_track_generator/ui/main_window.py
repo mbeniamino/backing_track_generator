@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -57,9 +57,14 @@ from ..transpose import (
     MAX_SPEED,
     MIN_SEMITONES,
     MIN_SPEED,
+    ENGINE_LABELS,
+    ENGINES,
+    NATIVE,
+    RUBBERBAND,
     SPEED_STEP,
     TranspositionCache,
     processed_length,
+    rubberband_available,
 )
 from .background import BackgroundCall
 from .cache_dialog import CacheDialog
@@ -252,6 +257,23 @@ class MainWindow(QMainWindow):
         self.act_speed_reset = QAction("Reset spee&d", self)
         self.act_speed_reset.setShortcut(QKeySequence("Ctrl+0"))
         self.act_speed_reset.triggered.connect(lambda: self.speed_spin.setValue(100))
+        # Engine for transposition and speed changes.
+        self._engine_group = QActionGroup(self)
+        self._engine_group.setExclusive(True)
+        self._engine_actions: dict[str, QAction] = {}
+        engine = self.settings.stretch_engine
+        if engine == RUBBERBAND and not rubberband_available():
+            engine = NATIVE
+        self._stretch_engine = engine
+        for name in ENGINES:
+            act = QAction(ENGINE_LABELS[name], self, checkable=True)
+            act.setChecked(name == engine)
+            if name == RUBBERBAND and not rubberband_available():
+                act.setEnabled(False)
+                act.setText(f"{ENGINE_LABELS[name]} (not installed)")
+            act.triggered.connect(lambda _checked, n=name: self.set_stretch_engine(n))
+            self._engine_group.addAction(act)
+            self._engine_actions[name] = act
 
         self.act_separate = QAction(
             theme.icon("split"), "&Separate into stems", self)
@@ -328,6 +350,9 @@ class MainWindow(QMainWindow):
         transport_menu.addAction(self.act_speed_up)
         transport_menu.addAction(self.act_speed_down)
         transport_menu.addAction(self.act_speed_reset)
+        engine_menu = transport_menu.addMenu("Pitch/speed &engine")
+        for act in self._engine_actions.values():
+            engine_menu.addAction(act)
         beats_menu = self.menuBar().addMenu("&Beats")
         beats_menu.addAction(self.act_count_in)
         beats_menu.addSeparator()
@@ -805,7 +830,8 @@ class MainWindow(QMainWindow):
                 self._apply_version(target, datas)
             self._update_transpose_status()
             return
-        job = TransposeJob(cache.originals, self.engine.sample_rate, *target, self._track_generation, parent=self)
+        job = TransposeJob(cache.originals, self.engine.sample_rate, *target, self._track_generation, parent=self,
+                           engine=self._stretch_engine)
         job.progress.connect(self._on_transpose_progress)
         job.finished.connect(self._on_transpose_finished)
         job.failed.connect(self._on_transpose_failed)
@@ -840,15 +866,19 @@ class MainWindow(QMainWindow):
             self._transpose_job = None
         self._update_transpose_status()
 
-    def _on_transpose_progress(self, _fraction: float) -> None:
+    def _on_transpose_progress(self, fraction: float) -> None:
         job = self._transpose_job
         if job is None:
             return
         parts = [f"{job.semitones:+d} st" if job.semitones else "", f"{job.speed}%" if job.speed != 100 else ""]
         self.tr_label.setText(f"Rendering {', '.join(p for p in parts if p) or 'original'}…")
-        # Tracks render in parallel and finish together, so a percentage would
-        # sit at 0% then jump: show a busy indicator instead.
-        self.tr_progress.setRange(0, 0)
+        if job.engine == NATIVE:
+            self.tr_progress.setRange(0, 1000)
+            self.tr_progress.setValue(int(fraction * 1000))
+        else:
+            # Rubber Band only reports finished tracks, and they render in parallel
+            # and finish together: a percentage would sit at 0% then jump.
+            self.tr_progress.setRange(0, 0)
         self.tr_label.show()
         self.tr_progress.show()
 
@@ -1231,6 +1261,23 @@ class MainWindow(QMainWindow):
         gain = self.engine.tracks[idx].gain if idx is not None else METRONOME_DEFAULT_GAIN
         # The count-in plays even if the metronome track is muted (that's the point).
         self.engine.play_with_count_in(ci.audio * max(gain, 0.3), ci.start * s)
+
+    def set_stretch_engine(self, engine: str) -> None:
+        """Switch the transposition/speed engine; the current version is
+        re-rendered with it (versions rendered by the other engine are dropped)."""
+        if engine == self._stretch_engine:
+            return
+        self._stretch_engine = engine
+        self.settings.stretch_engine = engine
+        self._engine_actions[engine].setChecked(True)
+        if self._transpose_cache is None:
+            return
+        # A job still running belongs to the old engine: its result is ignored
+        # once it's no longer the current job. The old engine's audio keeps
+        # playing until the new rendering is ready.
+        self._cancel_transpose_job()
+        self._transpose_cache = TranspositionCache(self._transpose_cache.originals)
+        self._apply_transpose()
 
     def _on_count_in_toggled(self, on: bool) -> None:
         self.settings.count_in = on

@@ -1,11 +1,13 @@
-"""Pitch shifting and tempo change (independently of each other) with the
-Rubber Band CLI.
+"""Pitch shifting and tempo change (independently of each other).
+
+Two engines: the built-in phase vocoder (``stretch``, the default, no external
+dependency) and the Rubber Band CLI (optional, if installed).
 
 Tracks are always processed from their original audio, never from an already
 processed version, so quality doesn't degrade as the user moves between
-values. Both changes are done in one pass. Each track runs in its own
-``rubberband`` process, in parallel. No Qt dependency; cancellation is via a
-``threading.Event``.
+values. Both changes are done in one pass. Tracks are processed in parallel
+(threads for the built-in engine, one ``rubberband`` process each otherwise).
+No Qt dependency; cancellation is via a ``threading.Event``.
 
 Speed is an integer percentage of the original tempo (100 = unchanged): at
 ``speed`` the processed audio lasts ``100 / speed`` times as long.
@@ -13,17 +15,21 @@ Speed is an integer percentage of the original tempo (100 = unchanged): at
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
 import threading
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 import soundfile as sf
+
+from . import stretch
+from .stretch import Cancelled
 
 MIN_SEMITONES = -12
 MAX_SEMITONES = 12
@@ -36,11 +42,14 @@ SPEED_STEP = 5
 FORMANT_PRESERVING = {"vocals"}
 
 
+NATIVE = "native"
+RUBBERBAND = "rubberband"
+ENGINES = (NATIVE, RUBBERBAND)
+DEFAULT_ENGINE = NATIVE
+ENGINE_LABELS = {NATIVE: "Built-in", RUBBERBAND: "Rubber Band"}
+
+
 class TransposeError(Exception):
-    pass
-
-
-class Cancelled(Exception):
     pass
 
 
@@ -56,8 +65,21 @@ def processed_length(frames: int, speed: int) -> int:
     return int(round(frames * 100 / speed))
 
 
-def _shift_one(data: np.ndarray, sr: int, semitones: int, speed: int, formant: bool, workdir: Path,
-               name: str, cancel: threading.Event) -> np.ndarray:
+def _fit(out: np.ndarray, length: int) -> np.ndarray:
+    """Pad or trim to exactly ``length`` frames, so all tracks stay aligned."""
+    if out.shape[0] < length:
+        out = np.concatenate([out, np.zeros((length - out.shape[0], out.shape[1]), np.float32)])
+    return np.ascontiguousarray(out[:length], dtype=np.float32)
+
+
+def _native_one(data: np.ndarray, sr: int, semitones: int, speed: int, name: str, cancel,
+                progress: Callable[[float], None]) -> np.ndarray:
+    out = stretch.shift(data, sr, semitones, speed, stretch.profile_for(name), cancel, progress)
+    return _fit(out, processed_length(data.shape[0], speed))
+
+
+def _rubberband_one(data: np.ndarray, sr: int, semitones: int, speed: int, formant: bool, workdir: Path,
+                    name: str, cancel: threading.Event) -> np.ndarray:
     if cancel.is_set():
         raise Cancelled
     src, dst, log = (workdir / f"{name}.{ext}" for ext in ("in.wav", "out.wav", "log"))
@@ -80,10 +102,7 @@ def _shift_one(data: np.ndarray, sr: int, semitones: int, speed: int, formant: b
         raise TransposeError(f"rubberband failed on {name}: {msg}")
     out, _ = sf.read(dst, dtype="float32", always_2d=True)
     # Rubber Band's output length is close to exact; guarantee alignment with the other tracks.
-    length = processed_length(data.shape[0], speed)
-    if out.shape[0] < length:
-        out = np.concatenate([out, np.zeros((length - out.shape[0], out.shape[1]), np.float32)])
-    return np.ascontiguousarray(out[:length])
+    return _fit(out, processed_length(data.shape[0], speed))
 
 
 def transpose_tracks(
@@ -93,12 +112,17 @@ def transpose_tracks(
     speed: int = 100,
     progress: Callable[[float], None] | None = None,
     cancel: threading.Event | None = None,
+    engine: str = DEFAULT_ENGINE,
 ) -> list[np.ndarray]:
     """Pitch-shift each (name, data) track by ``semitones`` and play it at
     ``speed`` % of its tempo; returns the new arrays in the same order.
     Raises Cancelled if ``cancel`` gets set."""
     if semitones == 0 and speed == 100:
         return [data for _, data in tracks]
+    if engine == NATIVE:
+        return _transpose_native(tracks, sr, semitones, speed, progress, cancel or threading.Event())
+    if engine != RUBBERBAND:
+        raise ValueError(f"unknown engine {engine!r}")
     if not rubberband_available():
         raise TransposeError("The 'rubberband' program was not found. Install Rubber Band (e.g. pacman -S rubberband).")
     cancel = cancel or threading.Event()
@@ -109,7 +133,7 @@ def transpose_tracks(
     with tempfile.TemporaryDirectory(prefix="btg-transpose-") as tmp, \
             ThreadPoolExecutor(max_workers=max(len(tracks), 1)) as pool:
         futures = [
-            pool.submit(_shift_one, data, sr, semitones, speed, name in FORMANT_PRESERVING, Path(tmp),
+            pool.submit(_rubberband_one, data, sr, semitones, speed, name in FORMANT_PRESERVING, Path(tmp),
                         f"{i:02d}", stop)
             for i, (name, data) in enumerate(tracks)
         ]
@@ -125,6 +149,41 @@ def transpose_tracks(
         if cancel.is_set():
             raise Cancelled
         return results
+
+
+def _transpose_native(tracks, sr, semitones, speed, progress, cancel) -> list[np.ndarray]:
+    abort = threading.Event()
+    stop = _AnyEvent(cancel, abort)
+    fractions = [0.0] * len(tracks)
+
+    def setter(i: int) -> Callable[[float], None]:
+        def set_fraction(f: float) -> None:
+            fractions[i] = f
+        return set_fraction
+
+    # numpy releases the GIL in FFTs and array arithmetic, so threads run in parallel.
+    with ThreadPoolExecutor(max_workers=max(1, min(len(tracks), os.cpu_count() or 1))) as pool:
+        futures = [pool.submit(_native_one, data, sr, semitones, speed, name, stop, setter(i))
+                   for i, (name, data) in enumerate(tracks)]
+        try:
+            # Report progress from the caller's thread, like the Rubber Band engine.
+            reported = -1.0
+            pending = set(futures)
+            while pending:
+                done, pending = wait(pending, timeout=0.1, return_when=FIRST_EXCEPTION)
+                for f in done:
+                    f.result()  # re-raise a failure (or Cancelled) right away
+                overall = sum(fractions) / len(fractions) if pending else 1.0
+                if progress and overall > reported:
+                    progress(overall)
+                    reported = overall
+            results = [f.result() for f in futures]
+        except BaseException:
+            abort.set()
+            raise
+    if cancel.is_set():
+        raise Cancelled
+    return results
 
 
 class _AnyEvent:

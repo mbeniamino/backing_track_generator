@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 
 from backing_track_generator.transpose import (
+    NATIVE,
+    RUBBERBAND,
     Cancelled,
     TranspositionCache,
     processed_length,
@@ -14,6 +16,7 @@ from backing_track_generator.transpose import (
 
 needs_rubberband = pytest.mark.skipif(not rubberband_available(), reason="rubberband CLI not installed")
 SR = 44100
+ENGINES = [NATIVE, pytest.param(RUBBERBAND, marks=needs_rubberband)]
 
 
 def sine(freq, seconds=1.0):
@@ -22,8 +25,9 @@ def sine(freq, seconds=1.0):
 
 
 def dominant_freq(x):
-    spec = np.abs(np.fft.rfft(x[:, 0] * np.hanning(len(x))))
-    return np.fft.rfftfreq(len(x), 1 / SR)[spec.argmax()]
+    n = 8 * len(x)  # zero-padded: finer frequency resolution for short excerpts
+    spec = np.abs(np.fft.rfft(x[:, 0] * np.hanning(len(x)), n))
+    return np.fft.rfftfreq(n, 1 / SR)[spec.argmax()]
 
 
 def test_zero_semitones_is_identity():
@@ -31,27 +35,30 @@ def test_zero_semitones_is_identity():
     assert transpose_tracks([("a", data)], SR, 0)[0] is data
 
 
-@needs_rubberband
+@pytest.mark.parametrize("engine", ENGINES)
 @pytest.mark.parametrize("semitones", [-5, 3, 12])
-def test_transposes_pitch_and_keeps_length(semitones):
+def test_transposes_pitch_and_keeps_length(semitones, engine):
     tracks = [("bass", sine(220)), ("vocals", sine(330))]
     fractions = []
-    out = transpose_tracks(tracks, SR, semitones, progress=fractions.append)
+    out = transpose_tracks(tracks, SR, semitones, progress=fractions.append, engine=engine)
     ratio = 2 ** (semitones / 12)
     for (_, src), res in zip(tracks, out):
         assert res.shape == src.shape and res.dtype == np.float32
         assert dominant_freq(res[SR // 4: -SR // 4]) == pytest.approx(dominant_freq(src) * ratio, rel=0.02)
-    assert fractions == [0.5, 1.0]
+    if engine == RUBBERBAND:
+        assert fractions == [0.5, 1.0]
+    else:
+        assert fractions == sorted(fractions) and fractions[-1] == 1.0
 
 
-@needs_rubberband
-def test_cancel_stops_quickly():
+@pytest.mark.parametrize("engine", ENGINES)
+def test_cancel_stops_quickly(engine):
     cancel = threading.Event()
     tracks = [(f"t{i}", sine(220, seconds=60)) for i in range(4)]
     threading.Timer(0.3, cancel.set).start()
     t0 = time.time()
     with pytest.raises(Cancelled):
-        transpose_tracks(tracks, SR, 4, cancel=cancel)
+        transpose_tracks(tracks, SR, 4, cancel=cancel, engine=engine)
     assert time.time() - t0 < 3  # a full run takes far longer
 
 
@@ -63,7 +70,24 @@ def test_failure_reports_error(monkeypatch, tmp_path):
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path))
     with pytest.raises(transpose.TransposeError, match="boom"):
-        transpose_tracks([("a", sine(220, 0.1))], SR, 2)
+        transpose_tracks([("a", sine(220, 0.1))], SR, 2, engine=RUBBERBAND)
+
+
+def test_native_engine_needs_no_rubberband(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", str(tmp_path))  # no rubberband anywhere
+    out = transpose_tracks([("a", sine(220, 0.5))], SR, 2, 90)[0]
+    assert out.shape == (processed_length(SR // 2, 90), 2)
+
+
+def test_native_failure_propagates(monkeypatch):
+    from backing_track_generator import stretch
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(stretch, "shift", boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        transpose_tracks([("a", sine(220, 0.1)), ("b", sine(220, 0.1))], SR, 2)
 
 
 def test_cache_lru():
@@ -78,11 +102,11 @@ def test_cache_lru():
     assert c.cached() == [(0, 100), (1, 100), (0, 80)]
 
 
-@needs_rubberband
-@pytest.mark.parametrize("speed, semitones", [(80, 0), (125, 0), (70, 2)])
-def test_speed_changes_length_not_pitch(speed, semitones):
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("speed, semitones", [(80, 0), (125, 0), (70, 2), (50, 12), (150, -12)])
+def test_speed_changes_length_not_pitch(speed, semitones, engine):
     src = sine(220)
-    out = transpose_tracks([("bass", src)], SR, semitones, speed)[0]
+    out = transpose_tracks([("bass", src)], SR, semitones, speed, engine=engine)[0]
     assert out.shape == (processed_length(len(src), speed), 2) and out.dtype == np.float32
     assert out.shape[0] == pytest.approx(len(src) * 100 / speed, abs=1)
     ratio = 2 ** (semitones / 12)

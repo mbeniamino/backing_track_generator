@@ -8,8 +8,10 @@ saves the result as a project or renders it to a single audio file.
   (`htdemucs_6s`: vocals, guitar, piano, bass, drums, other), running locally
   on the CPU. The model is downloaded on first use.
 - **Transposition** by ±12 semitones without changing tempo, and **speed**
-  from 50 % to 150 % without changing pitch, with
-  [Rubber Band](https://breakfastquay.com/rubberband/) (formant-preserving for vocals).
+  from 50 % to 150 % without changing pitch, with a built-in phase vocoder
+  (phase-locked, with sharp transients for drums and formant preservation for
+  vocals). [Rubber Band](https://breakfastquay.com/rubberband/) can be used
+  instead if it's installed (Transport → Pitch/speed engine).
 - **Metronome and count-in** from beats detected with
   [beat_this](https://github.com/CPJKU/beat_this): the clicks follow the song's
   actual beats, so tempo drift and tempo changes are tracked.
@@ -18,11 +20,13 @@ saves the result as a project or renders it to a single audio file.
 
 - [uv](https://docs.astral.sh/uv/) (installs Python 3.12 and the Python dependencies)
 - System programs/libraries:
-  - `rubberband` command-line tool, for transposition and speed changes
   - `ffmpeg`, to open formats libsndfile can't read (m4a, aac, …)
   - PortAudio, for playback (usually already present)
 
-  On Arch Linux: `pacman -S rubberband ffmpeg portaudio`
+  - optionally, the `rubberband` command-line tool, as an alternative
+    transposition/speed engine
+
+  On Arch Linux: `pacman -S ffmpeg portaudio` (plus `rubberband` if wanted)
 
 The first `uv sync` downloads PyTorch (CPU-only build, ~1 GB).
 

@@ -43,6 +43,19 @@ class AppSettings:
         self._qs.setValue("transport/count_in", "true" if on else "false")
         self._qs.sync()
 
+    @property
+    def stretch_engine(self) -> str:
+        """Engine for transposition and speed changes (see transpose.ENGINES)."""
+        from ..transpose import DEFAULT_ENGINE, ENGINES
+
+        value = str(self._qs.value("transpose/engine", DEFAULT_ENGINE))
+        return value if value in ENGINES else DEFAULT_ENGINE
+
+    @stretch_engine.setter
+    def stretch_engine(self, engine: str) -> None:
+        self._qs.setValue("transpose/engine", engine)
+        self._qs.sync()
+
     @cache_limit.setter
     def cache_limit(self, limit: int | None) -> None:
         self._qs.setValue("cache/limit_bytes", "none" if limit is None else int(limit))
