@@ -153,3 +153,38 @@ def test_mono_and_tiny_inputs():
     assert time_stretch(np.zeros((3, 2), np.float32), SR, 0.5).shape == (2, 2)
     y = shift(np.zeros((100, 2), np.float32), SR, 4, 80)
     assert np.all(np.isfinite(y))
+
+
+# ----- streaming (real-time playback) --------------------------------------------
+
+
+@pytest.mark.parametrize("semitones, speed, name", [(0, 80, "drums"), (3, 90, "vocals"), (-5, 125, "bass"),
+                                                     (0, 100, "other"), (12, 50, "other")])
+def test_stream_from_start_matches_offline(semitones, speed, name):
+    rng = np.random.default_rng(2)
+    x = (rng.standard_normal((SR * 2, 2)) * 0.1).astype(np.float32)
+    profile = stretch.profile_for(name)
+    offline = shift(x, SR, semitones, speed, profile)
+    sh = stretch.StreamShifter(x, SR, semitones, speed, profile)
+    sizes = [1, 1023, 4096, 333, 8192]  # any read sizes
+    parts, total = [], 0
+    while total < len(offline) - 4096:
+        n = sizes[len(parts) % len(sizes)]
+        parts.append(sh.read(n))
+        total += n
+    streamed = np.concatenate(parts)
+    n = min(len(streamed), len(offline) - 200)  # the very end differs (offline output is cut there)
+    np.testing.assert_allclose(streamed[:n], offline[:n], atol=1e-5)
+
+
+@pytest.mark.parametrize("semitones, speed", [(0, 75), (4, 100), (-7, 140)])
+def test_stream_from_middle_sounds_the_same(semitones, speed):
+    x = tone([220.0, 330.0], 4.0)
+    offline = shift(x, SR, semitones, speed)
+    start = len(offline) // 2
+    streamed = stretch.StreamShifter(x, SR, semitones, speed, start=start).read(SR // 2)
+    ref = offline[start:start + SR // 2]
+    warm = 4096  # fresh phases: the first window differs
+    assert rms(streamed[warm:]) == pytest.approx(rms(ref[warm:]), rel=0.03)
+    spec = lambda y: np.abs(np.fft.rfft(y[warm:, 0] * np.hanning(len(y) - warm)))  # noqa: E731
+    assert np.corrcoef(spec(streamed), spec(ref))[0, 1] > 0.99

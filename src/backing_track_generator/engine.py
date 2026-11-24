@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .realtime import StreamSession
 
 CHANNELS = 2
 # Gain changes (mute/solo) fade over this long, to avoid clicks.
@@ -19,6 +23,11 @@ MIN_LOOP_SECONDS = 0.1
 # audio server reconfigures; responsiveness of mute/seek is unaffected in practice.
 STREAM_BLOCKSIZE = 1024
 STREAM_LATENCY_SECONDS = 0.05
+# A new real-time setting is prepared this far ahead of the playhead, then
+# takes over (crossfaded) when the playhead gets there.
+SWITCH_LEAD_SECONDS = 0.15
+# A switch or a deferred seek waits until this much audio is ready there.
+READY_SECONDS = 0.1
 
 
 @dataclass
@@ -35,6 +44,8 @@ class Track:
     tail_data: np.ndarray | None = None
     # "audio" (from the song) or "metronome" (generated: never transposed or saved as audio).
     kind: str = "audio"
+    # Index of this track in a real-time StreamSession (audio tracks only).
+    stream_index: int | None = None
 
     @property
     def is_audio(self) -> bool:
@@ -59,6 +70,12 @@ class AudioEngine:
     audio then lasts ``1 / speed`` times as long as the song. Times in seconds
     (position, seek, loop, duration) are always song time, as if at the
     original tempo; frames are always frames of the audio being played.
+
+    The song's tracks either play from arrays (``Track.data``) or, for
+    real-time transposition, from a ``StreamSession`` that renders them just
+    ahead of the playhead (``set_stream``). With a session, the playhead
+    waits (silence) if its audio isn't ready yet, and seeks happen once the
+    audio at the target is ready.
     """
 
     def __init__(self, use_device: bool = True):
@@ -88,6 +105,17 @@ class AudioEngine:
         self._overlay: np.ndarray | None = None
         self._overlay_pos = 0
         self._preroll = 0
+        # Real-time rendering: the session the song's tracks play from (None:
+        # their arrays), the previous one while crossfading away from it, a
+        # session waiting to take over (session, speed, length, arrays), and a
+        # seek waiting for its audio.
+        self._session: StreamSession | None = None
+        self._tail_session: StreamSession | None = None
+        self._pending: tuple | None = None
+        self._pending_jump: int | None = None
+        # The playhead is waiting for audio (or just started): it moves again
+        # once READY_SECONDS are rendered, so it doesn't stall again right away.
+        self._stalled = True
 
     # ----- loading -------------------------------------------------------
 
@@ -101,7 +129,11 @@ class AudioEngine:
         audible = audible_tracks(tracks)
         for t in tracks:
             t.level = t.gain if any(t is a for a in audible) else 0.0
+        audio = [t for t in tracks if t.is_audio]
+        for i, t in enumerate(audio):
+            t.stream_index = i
         with self._lock:
+            self._close_sessions()
             self._playing = False
             self._tracks = tracks
             self._length = self._song_length = length
@@ -133,6 +165,10 @@ class AudioEngine:
     def frames(self) -> int:
         """Length of the audio being played, in frames."""
         return self._length
+
+    def frames_at(self, speed: float) -> int:
+        """Length of the song's audio played at ``speed``, in frames."""
+        return self._song_length if speed == 1.0 else int(round(self._song_length / speed))
 
     @property
     def speed(self) -> float:
@@ -212,8 +248,9 @@ class AudioEngine:
 
     @property
     def position(self) -> float:
-        """Playhead position in song seconds."""
-        return self._to_seconds(self._pos)
+        """Playhead position in song seconds (a pending seek counts as done)."""
+        jump = self._pending_jump
+        return self._to_seconds(self._pos if jump is None else jump)
 
     def play(self) -> None:
         """Start playing. With an active loop, playback starts inside it: from
@@ -223,6 +260,7 @@ class AudioEngine:
                 return
             self._pos = self._start_frame()
             self._playing = True
+            self._stalled = True
 
     def _start_frame(self) -> int:
         if self._loop_active() and not self._in_loop(self._pos):
@@ -252,6 +290,7 @@ class AudioEngine:
             self._preroll = max(offset, 0)
             self._overlay_pos = 0 if offset >= 0 else offset
             self._playing = True
+            self._stalled = True
 
     @property
     def counting_in(self) -> bool:
@@ -283,15 +322,31 @@ class AudioEngine:
             self._playing = False
             self._end_crossfade()
             self._cancel_count_in()
+            self._pending_jump = None
             self._pos = self._loop_start if self._loop_active() else 0
+            self._update_wants()
 
     def seek(self, seconds: float) -> None:
         frame = self._to_frame(seconds)
         with self._lock:
-            if self._playing and frame != self._pos:
-                self._begin_crossfade(self._pos)
-            self._pos = frame
             self._cancel_count_in()
+            self._jump(frame)
+
+    def _jump(self, frame: int) -> None:
+        """Move the playhead, crossfaded while playing. With a session, a jump
+        while playing waits until the audio there is ready (the old position
+        keeps playing meanwhile)."""
+        self._pending_jump = None
+        if frame == self._pos:
+            pass
+        elif not self._playing:
+            self._pos = frame
+        elif self._session is not None and not self._ready(self._session, frame):
+            self._pending_jump = frame
+        else:
+            self._begin_crossfade(self._pos)
+            self._pos = frame
+        self._update_wants()
 
     # ----- loop ----------------------------------------------------------
 
@@ -302,10 +357,12 @@ class AudioEngine:
             self._loop_secs = (min(start, end), max(start, end))
             self._loop_start, self._loop_end = map(self._to_frame, self._loop_secs)
             self._loop_enabled = enabled
+            self._update_wants()
 
     def set_loop_enabled(self, enabled: bool) -> None:
         with self._lock:
             self._loop_enabled = enabled
+            self._update_wants()
 
     @property
     def loop_active(self) -> bool:
@@ -316,9 +373,7 @@ class AudioEngine:
         start (crossfaded while playing)."""
         with self._lock:
             if self._loop_active() and not self._in_loop(self._pos):
-                if self._playing:
-                    self._begin_crossfade(self._pos)
-                self._pos = self._loop_start
+                self._jump(self._loop_start)
 
     def _in_loop(self, frame: int) -> bool:
         return self._loop_start <= frame < self._loop_end
@@ -334,6 +389,9 @@ class AudioEngine:
         # If a crossfade is already running, restarting from the old tail is good enough.
         for t in self._tracks:
             t.tail_data = None
+        if self._tail_session is not None:
+            self._tail_session.close()
+            self._tail_session = None
         self._xfade_tail = tail
         self._xfade_left = max(int(CROSSFADE_SECONDS * self._sample_rate), 1)
 
@@ -341,6 +399,136 @@ class AudioEngine:
         self._xfade_left = 0
         for t in self._tracks:
             t.tail_data = None  # don't keep a whole old version alive
+        if self._tail_session is not None:
+            self._tail_session.close()
+            self._tail_session = None
+
+    # ----- real-time sessions -------------------------------------------
+
+    @property
+    def stream_session(self) -> StreamSession | None:
+        """The session the song's tracks play from (None: from their arrays)."""
+        return self._session
+
+    @property
+    def stream_error(self) -> str | None:
+        """Why a real-time session stopped rendering, if it did."""
+        for s in (self._session, self._pending[0] if self._pending else None):
+            if s is not None and s.error:
+                return s.error
+        return None
+
+    @property
+    def switch_pending(self) -> bool:
+        """A real-time session is waiting to take over (see set_stream)."""
+        return self._pending is not None
+
+    def _close_sessions(self) -> None:
+        for s in (self._session, self._tail_session, self._pending[0] if self._pending else None):
+            if s is not None:
+                s.close()
+        self._session = self._tail_session = self._pending = None
+        self._pending_jump = None
+
+    def _fit_all(self, datas: list[np.ndarray | None], length: int) -> list[np.ndarray | None]:
+        fitted = []
+        for d in datas:
+            if d is not None and d.shape[0] < length:
+                d = np.concatenate([d, np.zeros((length - d.shape[0], CHANNELS), np.float32)])
+            fitted.append(None if d is None else d[:length])
+        return fitted
+
+    def set_stream(self, session: StreamSession, speed: float, datas: list[np.ndarray | None] | None = None) -> None:
+        """Play the song's tracks from ``session`` (rendered at ``speed``,
+        relative to the original tempo), keeping position, loop, mute/solo and
+        play state. ``datas``: new audio for the other tracks (e.g. the
+        metronome at the new tempo), None entries to keep a track's audio.
+
+        While playing, the switch happens once the session has audio at the
+        playhead (a fraction of a second; the current audio plays until then),
+        crossfaded. Otherwise it is immediate."""
+        datas = datas or [None] * len(self._tracks)
+        if len(datas) != len(self._tracks):
+            raise ValueError("set_stream: track count mismatch")
+        speed = float(speed)
+        length = self.frames_at(speed)
+        fitted = self._fit_all(datas, length)
+        with self._lock:
+            if self._pending is not None and self._pending[0] is not session:
+                self._pending[0].close()
+            self._pending = (session, speed, length, fitted)
+            if not self._playing or self._preroll > 0:
+                self._apply_pending()
+            self._update_wants()
+
+    def _ready(self, session: StreamSession, frame: int) -> bool:
+        """Enough audio rendered at ``frame`` to jump there."""
+        need = min(int(READY_SECONDS * self._sample_rate), session.length - frame)
+        return need <= 0 or session.available(frame) >= need
+
+    def _pending_target(self) -> int:
+        """Frame of the pending session matching the playhead."""
+        _, speed, length, _ = self._pending
+        frame = self._pos if self._pending_jump is None else self._pending_jump
+        return min(max(int(round(frame * self._speed / speed)), 0), length)
+
+    def _apply_pending(self) -> None:
+        session, speed, length, fitted = self._pending
+        self._pending = None
+        self._switch(session, speed, length, fitted)
+
+    def _switch(self, session: StreamSession | None, speed: float, length: int,
+                fitted: list[np.ndarray | None]) -> None:
+        """Swap in new audio sources (lock held): crossfade while playing."""
+        if self._playing:
+            self._begin_crossfade(self._pos)
+            self._tail_session = self._session
+            for t in self._tracks:
+                # The tail reads the old session for its tracks, the old arrays otherwise.
+                t.tail_data = None if self._session is not None and t.stream_index is not None else t.data
+        elif self._session is not None and self._session is not session:
+            self._session.close()
+        self._session = session
+        for t, d in zip(self._tracks, fitted):
+            if d is not None:
+                t.data = d
+        if speed != self._speed:
+            song_pos = self._to_seconds(self._pos)
+            jump = None if self._pending_jump is None else self._to_seconds(self._pending_jump)
+            self._speed, self._length = speed, length
+            self._pos = self._to_frame(song_pos)
+            self._pending_jump = None if jump is None else self._to_frame(jump)
+            self._loop_start, self._loop_end = map(self._to_frame, self._loop_secs)
+            if self._preroll == 0:
+                self._overlay = None  # count-in clicks overlapping the song: at the old tempo
+
+    def _update_wants(self) -> None:
+        """Tell the sessions what audio is needed soon (lock held)."""
+        lead = int(SWITCH_LEAD_SECONDS * self._sample_rate)
+        keep = [self._xfade_tail] if self._xfade_left else []
+        if self._session is not None:
+            jumps = []
+            if self._pending_jump is not None:
+                jumps.append(self._pending_jump)
+            if self._loop_active():
+                jumps.append(self._loop_start)
+            self._session.set_wants(self._pos, jumps, keep)
+        if self._tail_session is not None:
+            self._tail_session.set_wants(None, [], keep)
+        if self._pending is not None:
+            self._pending[0].set_wants(None, [self._pending_target() + (lead if self._playing else 0)], [])
+
+    def _read(self, t: Track, pos: int, n: int) -> np.ndarray:
+        if self._session is not None and t.stream_index is not None:
+            return self._session.read(t.stream_index, pos, n)
+        return t.data[pos:pos + n]
+
+    def _read_tail(self, t: Track, pos: int, n: int) -> np.ndarray:
+        if self._tail_session is not None and t.stream_index is not None:
+            return self._tail_session.read(t.stream_index, pos, n)
+        if t.tail_data is not None:
+            return t.tail_data[pos:pos + n]
+        return self._read(t, pos, n)
 
     def swap_audio(self, datas: list[np.ndarray], speed: float | None = None) -> None:
         """Replace every track's audio (e.g. a transposed version) keeping
@@ -353,26 +541,14 @@ class AudioEngine:
         if len(datas) != len(self._tracks):
             raise ValueError("swap_audio: track count mismatch")
         speed = self._speed if speed is None else float(speed)
-        length = self._song_length if speed == 1.0 else int(round(self._song_length / speed))
-        fitted = []
-        for d in datas:
-            if d.shape[0] < length:
-                d = np.concatenate([d, np.zeros((length - d.shape[0], CHANNELS), np.float32)])
-            fitted.append(d[:length])
+        length = self.frames_at(speed)
+        fitted = self._fit_all(datas, length)
         with self._lock:
-            if self._playing:
-                self._begin_crossfade(self._pos)
-                for t in self._tracks:
-                    t.tail_data = t.data
-            for t, d in zip(self._tracks, fitted):
-                t.data = d
-            if speed != self._speed:
-                song_pos = self._to_seconds(self._pos)
-                self._speed, self._length = speed, length
-                self._pos = self._to_frame(song_pos)
-                self._loop_start, self._loop_end = map(self._to_frame, self._loop_secs)
-                if self._preroll == 0:
-                    self._overlay = None  # count-in clicks overlapping the song: at the old tempo
+            if self._pending is not None:  # a real-time switch that hasn't happened yet
+                self._pending[0].close()
+                self._pending = None
+            self._switch(None, speed, length, fitted)
+            self._update_wants()
 
     def render_block(self, out: np.ndarray) -> None:
         """Fill ``out`` (frames, 2) with the next block and advance the playhead,
@@ -381,6 +557,13 @@ class AudioEngine:
         with self._lock:
             frames = out.shape[0]
             filled = 0
+            if self._playing and self._preroll == 0:
+                if self._pending is not None and self._ready(self._pending[0], self._pending_target()):
+                    self._apply_pending()  # the new setting's audio is ready: switch now
+                jump = self._pending_jump
+                if jump is not None and self._session is not None and self._ready(self._session, jump):
+                    self._jump(jump)
+            self._update_wants()
             while self._playing and filled < frames:
                 if self._preroll > 0:  # count-in before the song
                     n = min(frames - filled, self._preroll)
@@ -393,6 +576,13 @@ class AudioEngine:
                 n = min(frames - filled, limit - self._pos)
                 if self._xfade_left:
                     n = min(n, self._xfade_left)
+                if n > 0 and self._session is not None and self._pos < self._session.length:
+                    ready = self._session.available(self._pos)
+                    if ready <= 0 or (self._stalled and not self._ready(self._session, self._pos)):
+                        self._stalled = True
+                        break  # audio not rendered yet: silence, the playhead waits
+                    self._stalled = False
+                    n = min(n, ready)
                 if n > 0:
                     self._mix_segment(out[filled:filled + n], self._pos, n)
                     if self._overlay is not None:
@@ -455,10 +645,10 @@ class AudioEngine:
                 t.level = float(ramp[-1])
                 gain = ramp[:, None]
 
-            seg = t.data[pos:pos + n]
+            seg = self._read(t, pos, n)
             if xfade is not None:
                 tail, w_in, w_out = xfade
-                old = (t.tail_data if t.tail_data is not None else t.data)[tail:tail + n]
+                old = self._read_tail(t, tail, n)
                 seg = seg * w_in
                 seg[: old.shape[0]] += old * w_out[: old.shape[0]]  # tail may run past the end
             out += seg if gain is None else seg * gain
@@ -492,4 +682,6 @@ class AudioEngine:
 
     def close(self) -> None:
         self.pause()
+        with self._lock:
+            self._close_sessions()
         self._close_stream()

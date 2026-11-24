@@ -10,8 +10,11 @@ saves the result as a project or renders it to a single audio file.
 - **Transposition** by ±12 semitones without changing tempo, and **speed**
   from 50 % to 150 % without changing pitch, with a built-in phase vocoder
   (phase-locked, with sharp transients for drums and formant preservation for
-  vocals). [Rubber Band](https://breakfastquay.com/rubberband/) can be used
-  instead if it's installed (Transport → Pitch/speed engine).
+  vocals) that processes the tracks in real time while they play: changes are
+  heard within a fraction of a second. Rendering to a file uses the same
+  processing offline. [Rubber Band](https://breakfastquay.com/rubberband/) can
+  be used instead if it's installed (Transport → Pitch/speed engine); it
+  renders each setting before it plays.
 - **Metronome and count-in** from beats detected with
   [beat_this](https://github.com/CPJKU/beat_this): the clicks follow the song's
   actual beats, so tempo drift and tempo changes are tracked.

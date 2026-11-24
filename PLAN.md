@@ -8,9 +8,12 @@ See `specs` for the feature list.
   Runs in a worker process with progress reporting; results cached per input file (hash).
   Fallback: `audio-separator` package.
 - **Playback:** `sounddevice` (PortAudio) output stream; numpy mixing in the callback.
-- **Transpose:** offline, built-in phase vocoder (`stretch.py`: identity phase locking, transient
-  phase reset, cepstral formant preservation, windowed-sinc resampling; numpy only) per stem,
-  with the Rubber Band CLI as an optional alternative engine; rendered in parallel
+- **Transpose:** built-in phase vocoder (`stretch.py`: identity phase locking, transient
+  phase reset, cepstral formant preservation, windowed-sinc resampling; numpy only) per stem.
+  Playback processes in real time (`realtime.py`: background threads render each stem ~1 s
+  ahead of the playhead, plus the loop start and pending seeks; the engine waits rather than
+  skips if audio isn't ready). File rendering runs the same code offline.
+  The Rubber Band CLI is an optional alternative engine that renders beforehand, in parallel
   in the background; old audio keeps playing until the new one is ready, then hot-swapped.
   Cached per semitone value (LRU-capped for memory).
 - **I/O:** `soundfile` + ffmpeg for decoding mp3/m4a/etc.
@@ -22,7 +25,8 @@ app/
   main.py
   separation.py     # Demucs wrapper, worker process, progress → UI
   engine.py         # audio stream, mixer, playhead, loop, mute/solo (thread-safe state)
-  stretch.py        # built-in phase vocoder time-stretch + resampler (pitch shift)
+  stretch.py        # built-in phase vocoder time-stretch + resampler (pitch shift), offline and streaming
+  realtime.py       # renders the stems ahead of the playhead for real-time playback
   transpose.py      # engine choice (built-in / rubberband) per stem, cache by semitone
   project.py        # save/load: <name>/stems/*.flac + project.json
   render.py         # mix audible stems → WAV/FLAC
