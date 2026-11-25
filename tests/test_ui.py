@@ -1234,3 +1234,87 @@ def test_realtime_render_dialog_can_be_cancelled(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(win, "_render_offline", lambda version: None)  # e.g. cancelled
     assert win.render_to_file(path=tmp_path / "x.wav") is None and not (tmp_path / "x.wav").exists()
     win.close()
+
+
+def test_timeline_zoom_pan_and_follow(qapp):
+    from backing_track_generator.ui.timeline import MIN_VIEW_SECONDS, Timeline
+
+    tl = Timeline()
+    tl.set_duration(100.0)
+    assert tl.view == (0.0, 100.0) and not tl.zoomed
+
+    tl.zoom(0.5, anchor=50.0)  # the anchor stays put on screen
+    assert tl.view == pytest.approx((25.0, 75.0))
+    assert tl.x_to_time(500, 1000) == pytest.approx(50.0)
+    assert tl.time_to_x(25.0, 1000) == pytest.approx(0.0)
+
+    tl.pan(-100)  # clamped to the song
+    assert tl.view == pytest.approx((0.0, 50.0))
+    tl.pan(1000)
+    assert tl.view == pytest.approx((50.0, 100.0))
+
+    tl.zoom(1e-6, anchor=60.0)
+    assert tl.view[1] - tl.view[0] == pytest.approx(MIN_VIEW_SECONDS)
+    tl.zoom(1e6, anchor=60.0)
+    assert tl.view == (0.0, 100.0)
+
+    # Playback running off the right edge pages the view along...
+    tl.zoom(0.1, anchor=0.0)
+    assert tl.view == pytest.approx((0.0, 10.0))
+    tl.set_position(9.9)
+    tl.set_position(10.1)
+    assert tl.view == pytest.approx((10.1, 20.1))
+    # ...but not once the user has scrolled away from the playhead.
+    tl.pan(30)
+    tl.set_position(10.3)
+    assert tl.view == pytest.approx((40.1, 50.1))
+
+    tl.set_duration(50.0)  # a new song shows all of it
+    assert tl.view == (0.0, 50.0)
+
+
+def test_wheel_zoom_and_middle_drag_pan(qapp, tmp_path):
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent, QWheelEvent
+
+    win = make_window()
+    win.open_file(make_song(tmp_path, seconds=10.0), separate=False)
+    qapp.processEvents()
+    wave = win._lanes[0].waveform
+    tl = win.timeline
+    mid = QPointF(wave.width() / 2, wave.height() / 2)
+
+    def wheel(dy, modifiers=Qt.KeyboardModifier.NoModifier):
+        event = QWheelEvent(mid, wave.mapToGlobal(mid), QPoint(), QPoint(0, dy), Qt.MouseButton.NoButton,
+                            modifiers, Qt.ScrollPhase.NoScrollPhase, False)
+        QApplication.sendEvent(wave, event)
+
+    for _ in range(3):
+        wheel(120)
+    start, end = tl.view
+    assert end - start < 10.0
+    assert (start + end) / 2 == pytest.approx(5.0, abs=0.01)  # zoomed around the cursor
+    wave.grab()
+    win.ruler.grab()
+
+    def mouse(kind, x, buttons):
+        pos = QPointF(x, mid.y())
+        event = QMouseEvent(kind, pos, wave.mapToGlobal(pos), Qt.MouseButton.MiddleButton, buttons,
+                            Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(wave, event)
+
+    span = end - start
+    position = win.engine.position
+    mouse(QMouseEvent.Type.MouseButtonPress, mid.x(), Qt.MouseButton.MiddleButton)
+    mouse(QMouseEvent.Type.MouseMove, mid.x() - wave.width() / 4, Qt.MouseButton.MiddleButton)
+    mouse(QMouseEvent.Type.MouseButtonRelease, mid.x() - wave.width() / 4, Qt.MouseButton.NoButton)
+    assert tl.view[0] == pytest.approx(start + span / 4)  # dragged the song left
+    assert win.engine.position == position  # panning does not seek
+
+    wheel(120, Qt.KeyboardModifier.ShiftModifier)  # Shift+wheel scrolls
+    assert tl.view[0] < start + span / 4
+
+    for _ in range(20):
+        wheel(-120)
+    assert tl.view == (0.0, pytest.approx(10.0))
+    win.close()

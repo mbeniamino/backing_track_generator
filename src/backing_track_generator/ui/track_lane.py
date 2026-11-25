@@ -93,6 +93,9 @@ class WaveformView(TimelineWidget):
         self._cache = None
         super().resizeEvent(event)
 
+    def on_view_changed(self) -> None:
+        self._invalidate()
+
     def _render_cache(self) -> QPixmap:
         dpr = self.devicePixelRatioF()
         w, h = max(int(self.width() * dpr), 1), max(int(self.height() * dpr), 1)
@@ -112,7 +115,12 @@ class WaveformView(TimelineWidget):
         p.setPen(QPen(center, dpr))
         p.drawLine(QLineF(0, mid, w, mid))
 
-        cols = resample_peaks(self._peaks, w)
+        duration = self.timeline.duration
+        start, end = self.timeline.view
+        if duration > 0:
+            cols = resample_peaks(self._peaks, w, start / duration, end / duration)
+        else:
+            cols = resample_peaks(self._peaks, w)
         scale = (h / 2 - 2 * dpr) / max(self._reference_peak, 1e-6) * 0.95 * self._gain
         top = np.clip(mid - cols[:, 1] * scale, 0, h)
         bottom = np.clip(mid - cols[:, 0] * scale, 0, h)

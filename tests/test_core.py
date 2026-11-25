@@ -121,6 +121,15 @@ def test_resample_peaks_width(width):
         np.testing.assert_allclose(cols[0], [-0.9, 0.8])
 
 
+
+def test_resample_peaks_range():
+    peaks = np.array([[-0.1, 0.1], [-0.9, 0.2], [-0.3, 0.8], [0, 0]], np.float32)
+    # Second half only: the -0.9 peak is outside it.
+    np.testing.assert_allclose(resample_peaks(peaks, 1, 0.5, 1.0)[0], [-0.3, 0.8])
+    # Zoomed in past one peak per column: columns repeat their peak.
+    cols = resample_peaks(peaks, 4, 0.25, 0.5)
+    np.testing.assert_allclose(cols, [[-0.9, 0.2]] * 4)
+
 # ----- audio io ------------------------------------------------------------
 
 def test_to_stereo_mono_duplicated():

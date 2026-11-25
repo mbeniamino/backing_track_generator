@@ -1,4 +1,5 @@
-"""Shared timeline state (duration, playhead, loop) and the time ruler widget."""
+"""Shared timeline state (duration, playhead, loop, visible range) and the
+time ruler widget."""
 
 from __future__ import annotations
 
@@ -22,6 +23,9 @@ _TICK_STEPS = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600]
 _MIN_TICK_PX = 70
 _EDGE_GRAB_PX = 5  # how close to a loop edge a press grabs it
 _DRAG_THRESHOLD_PX = 3  # movement that turns a ruler click into a loop drag
+MIN_VIEW_SECONDS = 1.0  # deepest zoom: this much time across the widget
+_WHEEL_ZOOM = 0.8  # view span factor per wheel notch (120 units) towards you
+_WHEEL_PAN = 0.1  # fraction of the view panned per horizontal / Shift+wheel notch
 
 
 class Timeline(QObject):
@@ -29,6 +33,9 @@ class Timeline(QObject):
 
     The loop is stored even when disabled so it can be toggled back on.
     ``loop`` is None when no region has been set.
+
+    The view is the part of the song shown across the widgets' width: all of
+    it until the user zooms in.
     """
 
     durationChanged = Signal(float)
@@ -36,6 +43,7 @@ class Timeline(QObject):
     seekRequested = Signal(float)
     loopChanged = Signal()  # any change, including every step of a drag
     loopCommitted = Signal()  # an edit is complete (drag released, key, toggle)
+    viewChanged = Signal()
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -43,6 +51,8 @@ class Timeline(QObject):
         self._position = 0.0
         self._loop: tuple[float, float] | None = None
         self._loop_enabled = False
+        self._view_start = 0.0
+        self._view_span = 0.0
 
     @property
     def duration(self) -> float:
@@ -56,12 +66,20 @@ class Timeline(QObject):
         self._duration = max(seconds, 0.0)
         self._loop = None
         self._loop_enabled = False
+        self._view_start, self._view_span = 0.0, self._duration
         self.durationChanged.emit(self._duration)
         self.loopChanged.emit()
+        self.viewChanged.emit()
 
     def set_position(self, seconds: float) -> None:
         if seconds != self._position:
+            was_visible = self.in_view(self._position)
             self._position = seconds
+            if was_visible and not self.in_view(seconds):
+                # Follow the playhead when it leaves the view (playback running
+                # off the edge, loop wrap, back to start), but not after the
+                # user has panned away from it.
+                self._set_view_start(seconds)
             self.positionChanged.emit(seconds)
 
     # ----- loop ----------------------------------------------------------
@@ -99,22 +117,70 @@ class Timeline(QObject):
         self._loop_enabled = False
         self.loopChanged.emit()
 
+    # ----- visible range (zoom and pan) -----------------------------------
+
+    @property
+    def view(self) -> tuple[float, float]:
+        return self._view_start, self._view_start + self._view_span
+
+    @property
+    def zoomed(self) -> bool:
+        return self._view_span < self._duration
+
+    def in_view(self, t: float) -> bool:
+        start, end = self.view
+        return start <= t <= end
+
+    def zoom(self, factor: float, anchor: float) -> None:
+        """Scale the view span by ``factor`` (< 1 zooms in), keeping the time
+        ``anchor`` at the same place on screen."""
+        if self._duration <= 0:
+            return
+        min_span = min(MIN_VIEW_SECONDS, self._duration)
+        span = min(max(self._view_span * factor, min_span), self._duration)
+        if span == self._view_span:
+            return
+        frac = (anchor - self._view_start) / self._view_span if self._view_span > 0 else 0.0
+        self._view_span = span
+        if not self._set_view_start(anchor - frac * span):
+            self.viewChanged.emit()
+
+    def pan(self, seconds: float) -> None:
+        self._set_view_start(self._view_start + seconds)
+
+    def reset_view(self) -> None:
+        self._view_span = self._duration
+        if not self._set_view_start(0.0):
+            self.viewChanged.emit()
+
+    def _set_view_start(self, start: float) -> bool:
+        """Returns whether the view moved (and so viewChanged was emitted)."""
+        start = min(max(start, 0.0), max(self._duration - self._view_span, 0.0))
+        if start == self._view_start:
+            return False
+        self._view_start = start
+        self.viewChanged.emit()
+        return True
+
     # ----- x <-> time mapping for a widget of a given width ------------------
 
     def x_to_time(self, x: float, width: int) -> float:
-        if width <= 0 or self._duration <= 0:
+        if width <= 0 or self._view_span <= 0:
             return 0.0
-        return min(max(x / width, 0.0), 1.0) * self._duration
+        return self._view_start + min(max(x / width, 0.0), 1.0) * self._view_span
 
     def time_to_x(self, t: float, width: int) -> float:
-        if self._duration <= 0:
+        if self._view_span <= 0:
             return 0.0
-        return t / self._duration * width
+        return (t - self._view_start) / self._view_span * width
 
 
 class TimelineWidget(QWidget):
-    """Base for widgets drawn on the timeline: click/drag to seek, playhead and
-    loop region updates."""
+    """Base for widgets drawn on the timeline: click/drag to seek, wheel to
+    zoom, middle-drag to pan, playhead and loop region updates.
+
+    Subclasses customise the other buttons through ``on_press``, ``on_move``
+    and ``on_release``."""
 
     def __init__(self, timeline: Timeline, parent: QWidget | None = None):
         super().__init__(parent)
@@ -122,15 +188,65 @@ class TimelineWidget(QWidget):
         timeline.positionChanged.connect(self.update)
         timeline.durationChanged.connect(self.update)
         timeline.loopChanged.connect(self.update)
+        timeline.viewChanged.connect(self.on_view_changed)
         self.setCursor(Qt.CursorShape.IBeamCursor)
+        self._pan_anchor: tuple[float, float] | None = None  # (press x, view start)
+        self._idle_cursor = self.cursor()
+
+    def on_view_changed(self) -> None:
+        self.update()
+
+    def wheelEvent(self, event):
+        tl = self.timeline
+        if tl.duration <= 0:
+            return
+        delta = event.angleDelta()
+        dx, dy = delta.x(), delta.y()
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier and dx == 0:
+            dx, dy = dy, 0  # Shift+wheel pans
+        if abs(dx) > abs(dy):
+            start, end = tl.view
+            tl.pan(-dx / 120 * _WHEEL_PAN * (end - start))
+        elif dy:
+            tl.zoom(_WHEEL_ZOOM ** (dy / 120), tl.x_to_time(event.position().x(), self.width()))
+        event.accept()
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            if self.timeline.duration > 0:
+                self._pan_anchor = (event.position().x(), self.timeline.view[0])
+                self._idle_cursor = self.cursor()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif self._pan_anchor is None:
+            self.on_press(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pan_anchor is not None:
+            x0, start0 = self._pan_anchor
+            if self.width() > 0:
+                start, end = self.timeline.view
+                self.timeline.pan(start0 - (event.position().x() - x0) / self.width() * (end - start) - start)
+        else:
+            self.on_move(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            if self._pan_anchor is not None:
+                self._pan_anchor = None
+                self.setCursor(self._idle_cursor)
+        elif self._pan_anchor is None:
+            self.on_release(event)
+
+    def on_press(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._seek_to(event.position().x())
 
-    def mouseMoveEvent(self, event):
+    def on_move(self, event):
         if event.buttons() & Qt.MouseButton.LeftButton:
             self._seek_to(event.position().x())
+
+    def on_release(self, event):
+        pass
 
     def _seek_to(self, x: float) -> None:
         if self.timeline.duration > 0:
@@ -175,7 +291,8 @@ class TimeRuler(TimelineWidget):
         self.setFixedHeight(28)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.setToolTip("Click to jump · drag to set a loop · drag loop edges to adjust")
+        self.setToolTip("Click to jump · drag to set a loop · drag loop edges to adjust\n"
+                        "Wheel: zoom · middle-drag or Shift+wheel: scroll")
         self._drag = _Drag.NONE
         self._anchor_x = 0.0
 
@@ -188,7 +305,7 @@ class TimeRuler(TimelineWidget):
             return _Drag.NONE
         return _Drag.START if d0 <= d1 else _Drag.END
 
-    def mousePressEvent(self, event):
+    def on_press(self, event):
         if event.button() != Qt.MouseButton.LeftButton or self.timeline.duration <= 0:
             return
         x = event.position().x()
@@ -196,7 +313,7 @@ class TimeRuler(TimelineWidget):
         self._drag = edge if edge is not _Drag.NONE else _Drag.PENDING
         self._anchor_x = x
 
-    def mouseMoveEvent(self, event):
+    def on_move(self, event):
         x = event.position().x()
         tl = self.timeline
         if self._drag is _Drag.NONE:
@@ -218,7 +335,7 @@ class TimeRuler(TimelineWidget):
                 self._drag = _Drag.END if self._drag is _Drag.START else _Drag.START
             tl.set_loop(start, end, commit=False)
 
-    def mouseReleaseEvent(self, event):
+    def on_release(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         drag, self._drag = self._drag, _Drag.NONE
@@ -258,7 +375,8 @@ class TimeRuler(TimelineWidget):
             p.drawLine(QPointF(x0, 0), QPointF(x0, h))
             p.drawLine(QPointF(x1, 0), QPointF(x1, h))
 
-        px_per_s = w / duration
+        view_start, view_end = self.timeline.view
+        px_per_s = w / (view_end - view_start)
         step = next((s for s in _TICK_STEPS if s * px_per_s >= _MIN_TICK_PX), _TICK_STEPS[-1])
         font = p.font()
         font.setPointSizeF(font.pointSizeF() * 0.8)
@@ -266,12 +384,13 @@ class TimeRuler(TimelineWidget):
         minor = QColor(theme.TEXT_DIM)
         minor.setAlpha(90)
         p.setPen(QPen(minor, 1))
-        for i in range(int(duration / (step / 4)) + 1):  # minor ticks
-            x = i * step / 4 * px_per_s
+        last = min(view_end, duration)
+        for i in range(int(view_start / (step / 4)), int(last / (step / 4)) + 1):  # minor ticks
+            x = self.x_of(i * step / 4)
             p.drawLine(QPointF(x, h - 4), QPointF(x, h))
-        i = 0
-        while (t := i * step) <= duration:
-            x = t * px_per_s
+        i = int(view_start / step)  # the tick at or left of the view start, so its label shows
+        while (t := i * step) <= last:
+            x = self.x_of(t)
             p.setPen(QPen(theme.TEXT_DIM, 1))
             p.drawLine(QPointF(x, h - 9), QPointF(x, h))
             p.drawText(QRectF(x + 4, 0, 100, h - 5), Qt.AlignmentFlag.AlignVCenter, format_time(t, step < 1))

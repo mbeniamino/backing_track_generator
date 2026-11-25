@@ -49,6 +49,7 @@ uv run backing-track-generator my-project/     # open a saved project
 | Play / pause, stop | Space, Home (Stop returns to the loop start while looping) |
 | Go to the beginning | Ctrl+Home (Play from there counts in when Count-in is on) |
 | Jump | click on a waveform or the ruler (drag on a waveform to scrub) |
+| Zoom / scroll | mouse wheel on a waveform or the ruler zooms around the pointer; middle-drag, Shift+wheel or a horizontal wheel scrolls; while playing, the view follows the playhead until you scroll away |
 | Mute / solo a track | M / S buttons; Ctrl+click S solos only that track; Ctrl+R resets |
 | Track volume | slider in the track header (−∞ to +6 dB); double-click resets to 0 dB |
 | Set a loop | drag on the ruler; drag its edges to adjust; `[` / `]` set start / end at the playhead (if the playhead is outside the new loop, it jumps to the loop start) |
