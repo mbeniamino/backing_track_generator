@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
+from PySide6.QtCore import QLineF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QSlider, QToolButton, QVBoxLayout, QWidget
 
 from ..peaks import compute_peaks, resample_peaks
@@ -36,6 +36,33 @@ def gain_to_db(gain: float) -> int:
 
 def format_db(db: int) -> str:
     return "−∞ dB" if db <= GAIN_MIN_DB else ("0 dB" if db == 0 else f"{db:+d} dB")
+
+
+def _premultiplied(color: QColor) -> np.ndarray:
+    """(B, G, R, A) premultiplied, 0..255 floats: QImage ARGB32 byte order on
+    little-endian machines."""
+    a = color.alpha() / 255
+    return np.array([color.blue() * a, color.green() * a, color.red() * a, color.alpha()], np.float32)
+
+
+def rasterize_waveform(top: np.ndarray, bottom: np.ndarray, height: int, edge: QColor, core: QColor) -> np.ndarray:
+    """Fill each column between ``top`` and ``bottom`` (pixel coordinates) with
+    a vertical gradient (``edge`` at the top and bottom of the image, ``core``
+    in the middle), anti-aliased by pixel coverage. Returns (height, width, 4)
+    uint8 premultiplied BGRA.
+
+    Done with whole-array numpy operations rather than QPainter.drawPolygon:
+    numpy releases the GIL while it works, drawPolygon holds it, and the audio
+    callback needs the GIL to run (zooming re-renders every lane)."""
+    rows = np.arange(height, dtype=np.float32)[:, None]
+    coverage = np.minimum(rows + 1, bottom[None, :].astype(np.float32))
+    coverage -= np.maximum(rows, top[None, :].astype(np.float32))
+    np.clip(coverage, 0.0, 1.0, out=coverage)
+    t = np.abs((rows[:, 0] + 0.5) / (height / 2) - 1.0)[:, None]  # 0 in the middle, 1 at the edges
+    gradient = _premultiplied(core) * (1 - t) + _premultiplied(edge) * t  # (height, 4)
+    out = coverage[:, :, None] * gradient[:, None, :]
+    out += 0.5
+    return out.astype(np.uint8)
 
 
 class WaveformView(TimelineWidget):
@@ -131,21 +158,14 @@ class WaveformView(TimelineWidget):
         scale = (h / 2 - 2 * dpr) / max(self._reference_peak, 1e-6) * 0.95 * self._gain
         top = np.clip(mid - cols[:, 1] * scale, 0, h)
         bottom = np.clip(mid - cols[:, 0] * scale, 0, h)
-        xs = np.arange(w) + 0.5
         # Make silent stretches still show a hairline.
         bottom = np.maximum(bottom, top + 0.6 * dpr)
-        shape = QPolygonF([QPointF(x, y) for x, y in zip(xs, top)]
-                          + [QPointF(x, y) for x, y in zip(xs[::-1], bottom[::-1])])
-        grad = QLinearGradient(0, 0, 0, h)
         edge, core = QColor(color).lighter(135), QColor(color)
         core.setAlpha(235 if self._active else 140)
         edge.setAlpha(255 if self._active else 150)
-        grad.setColorAt(0.0, edge)
-        grad.setColorAt(0.5, core)
-        grad.setColorAt(1.0, edge)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(grad)
-        p.drawPolygon(shape)
+        pixels = rasterize_waveform(top, bottom, h, edge, core)
+        image = QImage(pixels.data, w, h, 4 * w, QImage.Format.Format_ARGB32_Premultiplied)
+        p.drawImage(0, 0, image)  # before ``pixels`` goes away: the image doesn't copy it
         p.end()
         pm.setDevicePixelRatio(dpr)
         return pm

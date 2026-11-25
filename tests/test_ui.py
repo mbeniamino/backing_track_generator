@@ -1409,3 +1409,25 @@ def test_bar_ruler_drag_loops_whole_bars(qapp, tmp_path):
     drag(bars, w * 0.92, w * 0.92, steps=0)
     assert tl.loop is not None and win.engine.position == pytest.approx(8.5, abs=0.01)
     win.close()
+
+
+def test_rasterize_waveform_coverage_and_gradient(qapp):
+    from PySide6.QtGui import QColor
+
+    from backing_track_generator.ui.track_lane import rasterize_waveform
+
+    edge, core = QColor(255, 0, 0, 255), QColor(0, 0, 255, 255)
+    top = np.array([2.0, 0.0, 4.5])
+    bottom = np.array([6.0, 10.0, 5.0])
+    px = rasterize_waveform(top, bottom, 10, edge, core)  # BGRA
+    assert px.shape == (10, 3, 4) and px.dtype == np.uint8
+
+    alpha = px[:, :, 3]
+    np.testing.assert_array_equal(alpha[:, 0], [0, 0, 255, 255, 255, 255, 0, 0, 0, 0])  # rows 2..5 covered
+    assert (alpha[:, 1] == 255).all()  # full height
+    assert alpha[4, 2] == 128 and alpha[[3, 5], 2].sum() == 0  # half a pixel: anti-aliased
+
+    # Edge color (red) at the top and bottom, core color (blue) in the middle.
+    assert px[0, 1, 2] > 200 and px[0, 1, 0] < 50
+    assert px[9, 1, 2] > 200 and px[9, 1, 0] < 50
+    assert px[5, 1, 0] > 200 and px[5, 1, 2] < 50
