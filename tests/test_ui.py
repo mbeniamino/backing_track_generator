@@ -1314,6 +1314,11 @@ def test_wheel_zoom_and_middle_drag_pan(qapp, tmp_path):
     wheel(120, Qt.KeyboardModifier.ShiftModifier)  # Shift+wheel scrolls
     assert tl.view[0] < start + span / 4
 
+    assert win.act_zoom_reset.isEnabled() and win.act_zoom_reset.shortcut().toString() == "Z"
+    win.act_zoom_reset.trigger()
+    assert tl.view == (0.0, 10.0) and not win.act_zoom_reset.isEnabled()
+
+    wheel(120)
     for _ in range(20):
         wheel(-120)
     assert tl.view == (0.0, pytest.approx(10.0))

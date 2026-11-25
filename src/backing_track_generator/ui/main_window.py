@@ -237,6 +237,12 @@ class MainWindow(QMainWindow):
         self.act_loop_clear.setShortcut("Shift+L")
         self.act_loop_clear.triggered.connect(self.timeline.clear_loop)
 
+        self.act_zoom_reset = QAction("Show the &whole song (reset zoom)", self)
+        self.act_zoom_reset.setShortcut(Qt.Key.Key_Z)
+        self.act_zoom_reset.setEnabled(False)
+        self.act_zoom_reset.triggered.connect(self.timeline.reset_view)
+        self.timeline.viewChanged.connect(lambda: self.act_zoom_reset.setEnabled(self.timeline.zoomed))
+
         self.act_transpose_up = QAction("Transpose &up", self)
         self.act_transpose_up.setShortcuts([QKeySequence("+"), QKeySequence("=")])
         self.act_transpose_up.triggered.connect(lambda: self.transpose_spin.stepUp())
@@ -337,6 +343,8 @@ class MainWindow(QMainWindow):
         beats_menu.addSeparator()
         for a in self._beat_actions:
             beats_menu.addAction(a)
+        view_menu = self.menuBar().addMenu("&View")
+        view_menu.addAction(self.act_zoom_reset)
 
     def _build_ui(self) -> None:
         tb = self.addToolBar("Transport")
