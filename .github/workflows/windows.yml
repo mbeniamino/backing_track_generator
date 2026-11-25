@@ -126,7 +126,7 @@ jobs:
         with:
           name: windows-installer
           path: dist
-      - name: Check that the tag matches the app version
+      - name: Check the tag against the app version, and get its changelog
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
           if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
@@ -134,13 +134,22 @@ jobs:
             exit 1
           fi
           ls dist/BackingTrackGenerator-$version-Setup.exe
-      - name: Create the release (or update its installer when re-run)
+          # The release notes: the "## <version>" section of CHANGELOG.md.
+          awk -v v="$version" '/^## / { if (found) exit; found = ($2 == v); next } found' \
+            CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md has no \"## $version\" section (or it is empty)"
+            exit 1
+          fi
+          cat release-notes.md
+      - name: Create the release (or update its installer and notes when re-run)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/*-Setup.exe --clobber
+            gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md
           else
             gh release create "$GITHUB_REF_NAME" dist/*-Setup.exe \
-              --title "Backing Track Generator ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag
+              --title "Backing Track Generator ${GITHUB_REF_NAME#v}" --notes-file release-notes.md --verify-tag
           fi

@@ -117,8 +117,10 @@ stems, settings and downloaded models.
 
 On GitHub, the `Windows` workflow builds the installer on every push (download it
 from the run's Artifacts) and tests it on Windows: installed, test suite, start,
-uninstall. Pushing a tag `v<version>` matching `pyproject.toml` (e.g. `v0.1.0`)
-also publishes the installer as a GitHub Release once all checks pass.
+uninstall. Pushing a tag `v<version>` matching `pyproject.toml` (e.g. `v0.2.0`)
+also publishes the installer as a GitHub Release once all checks pass, with that
+version's section of `CHANGELOG.md` as the release notes (the release fails
+without one).
 
 Testing under Wine: use a separate `WINEPREFIX`, and set
 `WINEDLLOVERRIDES=winemenubuilder.exe=d` so the shortcuts don't end up in your Linux
