@@ -1,3 +1,5 @@
+import stat
+import sys
 import numpy as np
 import pytest
 import soundfile as sf
@@ -75,3 +77,11 @@ def test_bad_extension_and_unwritable(tmp_path):
         render_mix(tracks(), SR, tmp_path / "mix.xyz")
     with pytest.raises((RenderError, OSError)):
         render_mix(tracks(), SR, tmp_path / "missing-dir" / "mix.wav")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+def test_rendered_file_has_default_permissions(tmp_path):
+    plain = tmp_path / "plain"
+    plain.write_bytes(b"")  # what the umask gives a normally created file
+    res = render_mix(tracks(), SR, tmp_path / "mix.wav")
+    assert stat.S_IMODE(res.path.stat().st_mode) == stat.S_IMODE(plain.stat().st_mode)

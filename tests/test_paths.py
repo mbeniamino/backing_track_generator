@@ -1,4 +1,8 @@
+import stat
+import sys
 from pathlib import Path
+
+import pytest
 
 from backing_track_generator import fsutil, paths
 
@@ -47,3 +51,20 @@ def test_replace_retries_transient_lock(monkeypatch, tmp_path):
     monkeypatch.setattr(fsutil.time, "sleep", lambda s: None)
     fsutil.replace(src, dst)
     assert dst.read_text(encoding="utf-8") == "new" and len(calls) == 3
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
+def test_atomic_writes_get_default_permissions(tmp_path):
+    plain_file, plain_dir = tmp_path / "plain", tmp_path / "plain-dir"
+    plain_file.write_text("")
+    plain_dir.mkdir()
+
+    fsutil.write_text_atomic(tmp_path / "settings.json", "{}")
+    with fsutil.staged_dir(tmp_path / "project") as tmp:
+        (tmp / "a.txt").write_text("")
+
+    def mode(p):
+        return stat.S_IMODE(p.stat().st_mode)
+
+    assert mode(tmp_path / "settings.json") == mode(plain_file)
+    assert mode(tmp_path / "project") == mode(plain_dir)

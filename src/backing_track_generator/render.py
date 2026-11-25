@@ -11,7 +11,7 @@ import numpy as np
 import soundfile as sf
 
 from .engine import CHANNELS, Track, audible_tracks
-from .fsutil import replace
+from .fsutil import replace, set_default_mode
 
 # Extension -> soundfile write arguments.
 FORMATS: dict[str, dict] = {
@@ -85,6 +85,7 @@ def render_mix(tracks: list[Track], sample_rate: int, path: str | Path,
     fd, tmp = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=path.suffix, dir=path.parent)
     os.close(fd)
     try:
+        set_default_mode(tmp)
         sf.write(tmp, data, sample_rate, **fmt)
         replace(tmp, path)
     except Exception as e:
