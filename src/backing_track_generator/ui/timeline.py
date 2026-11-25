@@ -150,6 +150,12 @@ class Timeline(QObject):
         i = int(np.searchsorted(self._downbeats, t, side="right")) - 1
         return float(self._downbeats[i]) if i >= 0 else 0.0
 
+    def bar_end(self, t: float) -> float:
+        """End of the bar containing ``t``: the next bar start, or the end of
+        the song in the last bar."""
+        i = int(np.searchsorted(self._downbeats, t, side="right"))
+        return float(self._downbeats[i]) if i < len(self._downbeats) else self._duration
+
     def bar_stride(self, width: int) -> int:
         """Number every n-th bar so that the numbers fit across ``width`` px."""
         if self._bar_length <= 0 or self._view_span <= 0:
@@ -504,26 +510,49 @@ class TimeRuler(TimelineWidget):
 
 
 class BarRuler(TimelineWidget):
-    """Bar numbers from the beat grid. Click: jump to the start of a bar."""
+    """Bar numbers from the beat grid. Click: jump to the start of a bar.
+    Drag: loop the bars dragged over (whole bars, from bar line to bar line)."""
 
     def __init__(self, timeline: Timeline, parent: QWidget | None = None):
         super().__init__(timeline, parent)
         self.setFixedHeight(18)
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.setToolTip("Bars (from the detected beats) · click to jump to the start of a bar\n"
+        self.setToolTip("Bars (from the detected beats) · click to jump to the start of a bar · "
+                        "drag to loop whole bars\n"
                         "Wheel: zoom · middle-drag or Shift+wheel: scroll")
+        self._drag = _Drag.NONE
+        self._anchor_x = 0.0
+
+    def _time(self, x: float) -> float:
+        return self.timeline.x_to_time(x, self.width())
 
     def on_press(self, event):
-        self._jump_to_bar(event)
+        tl = self.timeline
+        if event.button() == Qt.MouseButton.LeftButton and tl.duration > 0 and len(tl.downbeats):
+            self._drag = _Drag.PENDING
+            self._anchor_x = event.position().x()
 
     def on_move(self, event):
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            self._jump_to_bar(event)
+        x = event.position().x()
+        if self._drag is _Drag.PENDING and abs(x - self._anchor_x) >= _DRAG_THRESHOLD_PX:
+            self._drag = _Drag.NEW
+        if self._drag is _Drag.NEW:
+            tl = self.timeline
+            a, b = sorted((self._time(self._anchor_x), self._time(x)))
+            tl.set_loop(tl.bar_start(a), tl.bar_end(b), enabled=True, commit=False)
 
-    def _jump_to_bar(self, event) -> None:
+    def on_release(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        drag, self._drag = self._drag, _Drag.NONE
         tl = self.timeline
-        if event.buttons() & Qt.MouseButton.LeftButton and tl.duration > 0 and len(tl.downbeats):
-            self._click_time(tl.bar_start(tl.x_to_time(event.position().x(), self.width())))
+        if drag is _Drag.PENDING:
+            self._click_time(tl.bar_start(self._time(event.position().x())))
+        elif drag is _Drag.NEW:
+            if tl.loop_valid:
+                tl.loopCommitted.emit()
+            else:
+                tl.clear_loop()
 
     def paintEvent(self, event):  # noqa: ARG002
         p = QPainter(self)

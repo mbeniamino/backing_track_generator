@@ -52,13 +52,13 @@ uv run backing-track-generator my-project/     # open a saved project
 | Zoom / scroll | mouse wheel on a waveform or the ruler zooms around the pointer; middle-drag, Shift+wheel or a horizontal wheel scrolls; Z shows the whole song again; while playing, the view follows the playhead until you scroll away |
 | Mute / solo a track | M / S buttons; Ctrl+click S solos only that track; Ctrl+R resets |
 | Track volume | slider in the track header (−∞ to +6 dB); double-click resets to 0 dB |
-| Set a loop | drag on the ruler; drag its edges to adjust; `[` / `]` set start / end at the playhead (if the playhead is outside the new loop, it jumps to the loop start) |
+| Set a loop | drag on the time ruler; drag on the bar numbers to loop whole bars; drag the loop edges on the time ruler to adjust; `[` / `]` set start / end at the playhead (if the playhead is outside the new loop, it jumps to the loop start) |
 | Toggle / clear the loop | L / Shift+L |
 | Transpose | toolbar − / + buttons, `+` / `-` keys, `0` to reset |
 | Speed (tempo) | toolbar − / + buttons in 5 % steps, `.` / `,` keys, Ctrl+0 to reset; the ruler, loop and beats stay in song time, and the metronome and count-in follow the new tempo |
 | Metronome | the top track, muted when a song is opened: unmute it to hear the click (mute / solo / volume like the others); accented on beat 1 |
 | Count-in | metronome button in the toolbar or C: one bar of clicks before playback starts, at the tempo where you start |
-| Bars | numbered under the time ruler, with bar lines on the waveforms (beat lines too when zoomed in); click a bar number to jump to the start of that bar |
+| Bars | numbered under the time ruler, with bar lines on the waveforms (beat lines too when zoomed in); click a bar number to jump to the start of that bar; drag over the bar numbers to loop those whole bars |
 | Fix the beats | Beats menu: double / halve tempo (Ctrl+Shift+↑/↓), bar start one beat earlier / later (Ctrl+Shift+←/→), clicks on the off-beat, reset |
 | Save project | Ctrl+S / Ctrl+Shift+S |
 | Render to one file | File → Render mix (Ctrl+Shift+E) or Render loop region; WAV, FLAC, MP3 or Ogg |

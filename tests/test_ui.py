@@ -1384,3 +1384,28 @@ def test_bars_shown_on_the_timeline(qapp, tmp_path):
     win.open_file(make_song(tmp_path, seconds=4.0), separate=False)
     assert len(tl.downbeats) == 0
     win.close()
+
+
+def test_bar_ruler_drag_loops_whole_bars(qapp, tmp_path):
+    from backing_track_generator.beats import BeatGrid, Corrections
+
+    win = loaded_window(tmp_path, seconds=10.0)
+    tl, bars = win.timeline, win.bar_ruler
+    beats = np.arange(0.5, 10.0, 0.5)
+    win._set_beats(BeatGrid(beats, beats[::4]), Corrections())  # bars start at 0.5, 2.5, 4.5, 6.5, 8.5
+    w = bars.width()
+
+    # From inside bar 2 back to inside bar 1: bars 1–2, bar line to bar line.
+    drag(bars, w * 0.30, w * 0.10)
+    assert tl.loop == (pytest.approx(0.5), pytest.approx(4.5))
+    assert tl.loop_enabled and win.engine.loop_active
+    assert 0.5 <= win.engine.position <= 4.5  # the playhead moved into the loop
+
+    # A short drag inside one bar loops that bar; the last bar runs to the end.
+    drag(bars, w * 0.90, w * 0.95)
+    assert tl.loop == (pytest.approx(8.5), pytest.approx(10.0))
+
+    # A plain click still just jumps to the bar start (inside the loop: kept).
+    drag(bars, w * 0.92, w * 0.92, steps=0)
+    assert tl.loop is not None and win.engine.position == pytest.approx(8.5, abs=0.01)
+    win.close()
