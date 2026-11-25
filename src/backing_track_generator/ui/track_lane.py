@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from PySide6.QtCore import QLineF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QImage, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QSlider, QToolButton, QVBoxLayout, QWidget
 
 from ..peaks import compute_peaks, resample_peaks
@@ -53,7 +53,7 @@ def rasterize_waveform(top: np.ndarray, bottom: np.ndarray, height: int, edge: Q
 
     Done with whole-array numpy operations rather than QPainter.drawPolygon:
     numpy releases the GIL while it works, drawPolygon holds it, and the audio
-    callback needs the GIL to run (zooming re-renders every lane)."""
+    callback needs the GIL to run (zooming re-renders every lane, often)."""
     rows = np.arange(height, dtype=np.float32)[:, None]
     coverage = np.minimum(rows + 1, bottom[None, :].astype(np.float32))
     coverage -= np.maximum(rows, top[None, :].astype(np.float32))
@@ -163,9 +163,23 @@ class WaveformView(TimelineWidget):
         edge, core = QColor(color).lighter(135), QColor(color)
         core.setAlpha(235 if self._active else 140)
         edge.setAlpha(255 if self._active else 150)
-        pixels = rasterize_waveform(top, bottom, h, edge, core)
-        image = QImage(pixels.data, w, h, 4 * w, QImage.Format.Format_ARGB32_Premultiplied)
-        p.drawImage(0, 0, image)  # before ``pixels`` goes away: the image doesn't copy it
+        if self.timeline.zoomed:
+            # Zooming and scrolling re-render often: keep the GIL free for the audio.
+            pixels = rasterize_waveform(top, bottom, h, edge, core)
+            image = QImage(pixels.data, w, h, 4 * w, QImage.Format.Format_ARGB32_Premultiplied)
+            p.drawImage(0, 0, image)  # before ``pixels`` goes away: the image doesn't copy it
+        else:
+            # The whole song: re-rendered rarely, so the smoother polygon is affordable.
+            xs = np.arange(w) + 0.5
+            shape = QPolygonF([QPointF(x, y) for x, y in zip(xs, top)]
+                              + [QPointF(x, y) for x, y in zip(xs[::-1], bottom[::-1])])
+            grad = QLinearGradient(0, 0, 0, h)
+            grad.setColorAt(0.0, edge)
+            grad.setColorAt(0.5, core)
+            grad.setColorAt(1.0, edge)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(grad)
+            p.drawPolygon(shape)
         p.end()
         pm.setDevicePixelRatio(dpr)
         return pm
