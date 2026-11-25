@@ -200,6 +200,30 @@ def test_ruler_click_seeks_and_drag_sets_loop(qapp, tmp_path):
     win.close()
 
 
+def test_click_outside_loop_clears_it(qapp, tmp_path):
+    win = loaded_window(tmp_path)
+    ruler, tl = win.ruler, win.timeline
+    wave = win._lanes[0].waveform
+    w = ruler.width()
+    drag(ruler, w * 0.2, w * 0.6)  # loop 2 s – 6 s
+    assert tl.loop_enabled
+
+    drag(ruler, w * 0.4, w * 0.4, steps=0)  # click inside: the loop stays
+    assert tl.loop is not None and win.engine.position == pytest.approx(4.0, abs=0.05)
+    drag(wave, wave.width() * 0.5, wave.width() * 0.5, steps=0)
+    assert tl.loop is not None and win.engine.position == pytest.approx(5.0, abs=0.05)
+
+    drag(ruler, w * 0.8, w * 0.8, steps=0)  # click outside on the ruler
+    assert tl.loop is None and not win.engine.loop_active
+    assert win.engine.position == pytest.approx(8.0, abs=0.05)  # not pulled back into the loop
+
+    drag(ruler, w * 0.2, w * 0.6)
+    win.act_loop.trigger()  # a loop that is switched off is cleared too
+    drag(wave, wave.width() * 0.1, wave.width() * 0.1, steps=0)  # click outside on a waveform
+    assert tl.loop is None and win.engine.position == pytest.approx(1.0, abs=0.05)
+    win.close()
+
+
 def test_tiny_ruler_drag_is_a_click(qapp, tmp_path):
     win = loaded_window(tmp_path)
     w = win.ruler.width()

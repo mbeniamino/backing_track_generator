@@ -239,7 +239,7 @@ class TimelineWidget(QWidget):
 
     def on_press(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._seek_to(event.position().x())
+            self._click_at(event.position().x())
 
     def on_move(self, event):
         if event.buttons() & Qt.MouseButton.LeftButton:
@@ -247,6 +247,18 @@ class TimelineWidget(QWidget):
 
     def on_release(self, event):
         pass
+
+    def _click_at(self, x: float) -> None:
+        """A click (not a drag) at ``x``: jump there. Clicking outside the
+        loop region clears the loop, first, so the jump is not pulled back
+        into it."""
+        tl = self.timeline
+        if tl.duration <= 0:
+            return
+        loop, t = tl.loop, tl.x_to_time(x, self.width())
+        if loop is not None and not loop[0] <= t <= loop[1]:
+            tl.clear_loop()
+        self._seek_to(x)
 
     def _seek_to(self, x: float) -> None:
         if self.timeline.duration > 0:
@@ -291,7 +303,8 @@ class TimeRuler(TimelineWidget):
         self.setFixedHeight(28)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.setToolTip("Click to jump · drag to set a loop · drag loop edges to adjust\n"
+        self.setToolTip("Click to jump (outside the loop: also clears it) · drag to set a loop · "
+                        "drag loop edges to adjust\n"
                         "Wheel: zoom · middle-drag or Shift+wheel: scroll")
         self._drag = _Drag.NONE
         self._anchor_x = 0.0
@@ -340,7 +353,7 @@ class TimeRuler(TimelineWidget):
             return
         drag, self._drag = self._drag, _Drag.NONE
         if drag is _Drag.PENDING:
-            self._seek_to(event.position().x())
+            self._click_at(event.position().x())
         elif drag is _Drag.NEW and not self.timeline.loop_valid:
             self.timeline.clear_loop()  # too short to be a loop: treat as a click
             self._seek_to(event.position().x())
