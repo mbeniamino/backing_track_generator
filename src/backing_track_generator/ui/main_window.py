@@ -67,7 +67,7 @@ from .background import BackgroundCall
 from .cache_dialog import CacheDialog
 from .settings import AppSettings
 from .separation_job import BeatJob, SeparationJob
-from .timeline import TimeRuler, Timeline
+from .timeline import BarRuler, TimeRuler, Timeline
 from . import theme
 from .track_lane import HEADER_OFFSET, TrackLane
 from .transpose_job import TransposeJob
@@ -404,9 +404,15 @@ class MainWindow(QMainWindow):
         ruler_row.setContentsMargins(0, 0, 0, 0)
         ruler_row.setSpacing(0)
         ruler_row.addSpacing(HEADER_OFFSET)
+        rulers = QVBoxLayout()
+        rulers.setContentsMargins(0, 0, 0, 0)
+        rulers.setSpacing(2)
         self.ruler = TimeRuler(self.timeline)
-        self.ruler.hide()  # shown once something is loaded
-        ruler_row.addWidget(self.ruler, 1)
+        self.bar_ruler = BarRuler(self.timeline)
+        for r in (self.ruler, self.bar_ruler):
+            r.hide()  # shown once something is loaded
+            rulers.addWidget(r)
+        ruler_row.addLayout(rulers, 1)
         outer.addLayout(ruler_row)
 
         self.lanes_layout = QVBoxLayout()
@@ -977,6 +983,7 @@ class MainWindow(QMainWindow):
         self._lanes.clear()
         self.placeholder.hide()
         self.ruler.show()
+        self.bar_ruler.show()
         self.timeline.set_duration(self.engine.duration)
         self.timeline.set_position(0.0)
         for i, track in enumerate(self.engine.tracks):
@@ -1013,6 +1020,7 @@ class MainWindow(QMainWindow):
         self._beat_corrections = Corrections()
         self._beat_grid = None
         self._beat_numbers = None
+        self.timeline.set_beat_grid(None)
         self._metronome_settings = None
         self.act_half_beat.blockSignals(True)
         self.act_half_beat.setChecked(False)
@@ -1088,6 +1096,7 @@ class MainWindow(QMainWindow):
         self.act_half_beat.blockSignals(False)
         self._beat_grid = effective_grid(detected, corrections)
         self._beat_numbers = self._beat_grid.beat_numbers()
+        self.timeline.set_beat_grid(self._beat_grid.beats, self._beat_grid.downbeats)
         audio = self._metronome_audio(self._speed)
 
         idx = self._metronome_index()

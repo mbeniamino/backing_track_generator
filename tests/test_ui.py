@@ -1347,3 +1347,40 @@ def test_wheel_zoom_and_middle_drag_pan(qapp, tmp_path):
         wheel(-120)
     assert tl.view == (0.0, pytest.approx(10.0))
     win.close()
+
+
+def test_bars_shown_on_the_timeline(qapp, tmp_path):
+    from backing_track_generator.beats import BeatGrid, Corrections
+
+    win = loaded_window(tmp_path, seconds=10.0)
+    tl, bars = win.timeline, win.bar_ruler
+    assert bars.isVisible() and len(tl.downbeats) == 0
+    bars.grab()  # no beats yet: an empty strip
+
+    beats = np.arange(0.5, 10.0, 0.5)  # 120 BPM, bars of 4 beats from 0.5 s
+    win._set_beats(BeatGrid(beats, beats[::4]), Corrections())
+    np.testing.assert_allclose(tl.downbeats, beats[::4])
+    assert [n for n, _ in tl.visible_bars(bars.width())] == [1, 2, 3, 4, 5]
+
+    # Zoomed out on a long song the numbers thin out; zoomed in, beats show.
+    assert tl.bar_stride(20) > 1
+    assert len(tl.visible_beats(bars.width())) > 0
+    assert len(tl.visible_beats(20)) == 0
+    tl.zoom(0.25, anchor=5.0)
+    # View 3.75 s – 6.25 s: bar 2 (from 2.5 s) labelled at the left edge, bar 4 (6.5 s) out of view.
+    assert [n for n, _ in tl.visible_bars(bars.width())] == [2, 3]
+    bars.grab()
+    win._lanes[0].waveform.grab()
+    tl.reset_view()
+
+    # Clicking the bar ruler jumps to the start of the clicked bar.
+    w = bars.width()
+    drag(bars, w * 0.48, w * 0.48, steps=0)  # 4.8 s, in bar 3 (4.5 s – 6.5 s)
+    assert win.engine.position == pytest.approx(4.5, abs=0.01)
+    drag(bars, w * 0.02, w * 0.02, steps=0)  # before bar 1: the song start
+    assert win.engine.position == pytest.approx(0.0, abs=0.01)
+
+    # A new song drops the old bars.
+    win.open_file(make_song(tmp_path, seconds=4.0), separate=False)
+    assert len(tl.downbeats) == 0
+    win.close()

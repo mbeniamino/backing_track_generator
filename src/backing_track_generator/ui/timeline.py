@@ -1,10 +1,11 @@
-"""Shared timeline state (duration, playhead, loop, visible range) and the
-time ruler widget."""
+"""Shared timeline state (duration, playhead, loop, visible range, beat grid)
+and the time and bar ruler widgets."""
 
 from __future__ import annotations
 
 from enum import Enum, auto
 
+import numpy as np
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
@@ -26,6 +27,11 @@ _DRAG_THRESHOLD_PX = 3  # movement that turns a ruler click into a loop drag
 MIN_VIEW_SECONDS = 1.0  # deepest zoom: this much time across the widget
 _WHEEL_ZOOM = 0.8  # view span factor per wheel notch (120 units) towards you
 _WHEEL_PAN = 0.1  # fraction of the view panned per horizontal / Shift+wheel notch
+_BAR_STRIDES = (1, 2, 4, 8, 16, 32, 64, 128)  # bars per numbered bar line
+_MIN_BAR_LABEL_PX = 28  # room needed between numbered bar lines
+_MIN_BEAT_PX = 14  # beat lines are drawn only when this far apart
+BAR_LINE = QColor(theme.TEXT_DIM.red(), theme.TEXT_DIM.green(), theme.TEXT_DIM.blue(), 55)
+BEAT_LINE = QColor(theme.TEXT_DIM.red(), theme.TEXT_DIM.green(), theme.TEXT_DIM.blue(), 22)
 
 
 class Timeline(QObject):
@@ -44,6 +50,7 @@ class Timeline(QObject):
     loopChanged = Signal()  # any change, including every step of a drag
     loopCommitted = Signal()  # an edit is complete (drag released, key, toggle)
     viewChanged = Signal()
+    gridChanged = Signal()
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -53,6 +60,9 @@ class Timeline(QObject):
         self._loop_enabled = False
         self._view_start = 0.0
         self._view_span = 0.0
+        self._beats = np.zeros(0)
+        self._downbeats = np.zeros(0)
+        self._bar_length = 0.0  # typical bar length, seconds
 
     @property
     def duration(self) -> float:
@@ -116,6 +126,59 @@ class Timeline(QObject):
         self._loop = None
         self._loop_enabled = False
         self.loopChanged.emit()
+
+    # ----- beat grid -------------------------------------------------------
+
+    @property
+    def beats(self) -> np.ndarray:
+        return self._beats
+
+    @property
+    def downbeats(self) -> np.ndarray:
+        """Bar starts: bar ``n`` (counting from 1) starts at ``downbeats[n - 1]``."""
+        return self._downbeats
+
+    def set_beat_grid(self, beats=None, downbeats=None) -> None:
+        """Beat and bar start times in seconds; None clears them."""
+        self._beats = np.zeros(0) if beats is None else np.asarray(beats, dtype=np.float64)
+        self._downbeats = np.zeros(0) if downbeats is None else np.asarray(downbeats, dtype=np.float64)
+        self._bar_length = float(np.median(np.diff(self._downbeats))) if len(self._downbeats) > 1 else 0.0
+        self.gridChanged.emit()
+
+    def bar_start(self, t: float) -> float:
+        """Start of the bar containing ``t`` (0 before the first bar)."""
+        i = int(np.searchsorted(self._downbeats, t, side="right")) - 1
+        return float(self._downbeats[i]) if i >= 0 else 0.0
+
+    def bar_stride(self, width: int) -> int:
+        """Number every n-th bar so that the numbers fit across ``width`` px."""
+        if self._bar_length <= 0 or self._view_span <= 0:
+            return _BAR_STRIDES[-1]
+        bar_px = self._bar_length / self._view_span * width
+        return next((n for n in _BAR_STRIDES if n * bar_px >= _MIN_BAR_LABEL_PX), _BAR_STRIDES[-1])
+
+    def visible_bars(self, width: int) -> list[tuple[int, float]]:
+        """(bar number, start time) of the numbered bars in view, starting with
+        the one at or left of the view so that its label shows."""
+        if len(self._downbeats) == 0:
+            return []
+        stride = self.bar_stride(width)
+        start, end = self.view
+        first = max(int(np.searchsorted(self._downbeats, start, side="right")) - 1, 0)
+        first -= first % stride
+        last = int(np.searchsorted(self._downbeats, end, side="right"))
+        return [(i + 1, float(self._downbeats[i])) for i in range(first, last, stride)]
+
+    def visible_beats(self, width: int) -> np.ndarray:
+        """Beat times in view, or none when they would be too close together."""
+        if len(self._beats) < 2 or self._view_span <= 0:
+            return np.zeros(0)
+        start, end = self.view
+        lo, hi = np.searchsorted(self._beats, [start, end])
+        seen = self._beats[lo:hi]
+        if len(seen) < 2 or np.median(np.diff(seen)) / self._view_span * width < _MIN_BEAT_PX:
+            return np.zeros(0)
+        return seen
 
     # ----- visible range (zoom and pan) -----------------------------------
 
@@ -189,11 +252,15 @@ class TimelineWidget(QWidget):
         timeline.durationChanged.connect(self.update)
         timeline.loopChanged.connect(self.update)
         timeline.viewChanged.connect(self.on_view_changed)
+        timeline.gridChanged.connect(self.on_grid_changed)
         self.setCursor(Qt.CursorShape.IBeamCursor)
         self._pan_anchor: tuple[float, float] | None = None  # (press x, view start)
         self._idle_cursor = self.cursor()
 
     def on_view_changed(self) -> None:
+        self.update()
+
+    def on_grid_changed(self) -> None:
         self.update()
 
     def wheelEvent(self, event):
@@ -249,16 +316,18 @@ class TimelineWidget(QWidget):
         pass
 
     def _click_at(self, x: float) -> None:
-        """A click (not a drag) at ``x``: jump there. Clicking outside the
-        loop region clears the loop, first, so the jump is not pulled back
-        into it."""
+        """A click (not a drag) at ``x``: jump there."""
+        if self.timeline.duration > 0:
+            self._click_time(self.timeline.x_to_time(x, self.width()))
+
+    def _click_time(self, t: float) -> None:
+        """Jump to ``t``. Clicking outside the loop region clears the loop,
+        first, so the jump is not pulled back into it."""
         tl = self.timeline
-        if tl.duration <= 0:
-            return
-        loop, t = tl.loop, tl.x_to_time(x, self.width())
+        loop = tl.loop
         if loop is not None and not loop[0] <= t <= loop[1]:
             tl.clear_loop()
-        self._seek_to(x)
+        tl.seekRequested.emit(t)
 
     def _seek_to(self, x: float) -> None:
         if self.timeline.duration > 0:
@@ -269,6 +338,19 @@ class TimelineWidget(QWidget):
 
     def playhead_x(self) -> float:
         return self.x_of(self.timeline.position)
+
+    def paint_grid(self, p: QPainter) -> None:
+        """Faint vertical lines at the numbered bars, and at the beats when
+        zoomed in far enough to tell them apart."""
+        h = self.height()
+        p.setPen(QPen(BEAT_LINE, 1))
+        for t in self.timeline.visible_beats(self.width()):
+            x = self.x_of(t)
+            p.drawLine(QPointF(x, 0), QPointF(x, h))
+        p.setPen(QPen(BAR_LINE, 1))
+        for _, t in self.timeline.visible_bars(self.width()):
+            x = self.x_of(t)
+            p.drawLine(QPointF(x, 0), QPointF(x, h))
 
     def paint_loop(self, p: QPainter, edges: bool = True) -> None:
         """Shade the loop region (orange when enabled, grey when disabled)."""
@@ -418,4 +500,63 @@ class TimeRuler(TimelineWidget):
         p.setBrush(PLAYHEAD_COLOR)
         p.drawPolygon(QPolygonF([QPointF(x - 6, 0), QPointF(x + 6, 0), QPointF(x, 10)]))
         p.setPen(QPen(PLAYHEAD_COLOR, 1.5))
+        p.drawLine(QPointF(x, 0), QPointF(x, h))
+
+
+class BarRuler(TimelineWidget):
+    """Bar numbers from the beat grid. Click: jump to the start of a bar."""
+
+    def __init__(self, timeline: Timeline, parent: QWidget | None = None):
+        super().__init__(timeline, parent)
+        self.setFixedHeight(18)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setToolTip("Bars (from the detected beats) · click to jump to the start of a bar\n"
+                        "Wheel: zoom · middle-drag or Shift+wheel: scroll")
+
+    def on_press(self, event):
+        self._jump_to_bar(event)
+
+    def on_move(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._jump_to_bar(event)
+
+    def _jump_to_bar(self, event) -> None:
+        tl = self.timeline
+        if event.buttons() & Qt.MouseButton.LeftButton and tl.duration > 0 and len(tl.downbeats):
+            self._click_time(tl.bar_start(tl.x_to_time(event.position().x(), self.width())))
+
+    def paintEvent(self, event):  # noqa: ARG002
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        bg = QPainterPath()
+        bg.addRoundedRect(QRectF(0, 0, w, h), 5, 5)
+        p.fillPath(bg, theme.LANE_BG)
+        if self.timeline.duration <= 0:
+            return
+        p.setClipPath(bg)
+        self.paint_loop(p, edges=False)
+
+        tl = self.timeline
+        start, end = tl.view
+        lo, hi = np.searchsorted(tl.downbeats, [start, end])
+        if tl.bar_stride(w) > 1 and hi - lo < w / 4:  # unnumbered bars, while not too dense
+            minor = QColor(theme.TEXT_DIM)
+            minor.setAlpha(70)
+            p.setPen(QPen(minor, 1))
+            for t in tl.downbeats[lo:hi]:
+                x = self.x_of(t)
+                p.drawLine(QPointF(x, h - 4), QPointF(x, h))
+        font = p.font()
+        font.setPointSizeF(font.pointSizeF() * 0.75)
+        p.setFont(font)
+        for number, t in tl.visible_bars(w):
+            x = self.x_of(t)
+            p.setPen(QPen(theme.TEXT_DIM, 1))
+            p.drawLine(QPointF(x, 0), QPointF(x, h))
+            p.setPen(theme.TEXT)
+            p.drawText(QRectF(x + 3, 0, 60, h), Qt.AlignmentFlag.AlignVCenter, str(number))
+
+        p.setPen(QPen(PLAYHEAD_COLOR, 1.5))
+        x = self.playhead_x()
         p.drawLine(QPointF(x, 0), QPointF(x, h))

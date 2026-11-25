@@ -96,6 +96,9 @@ class WaveformView(TimelineWidget):
     def on_view_changed(self) -> None:
         self._invalidate()
 
+    def on_grid_changed(self) -> None:
+        self._invalidate()
+
     def _render_cache(self) -> QPixmap:
         dpr = self.devicePixelRatioF()
         w, h = max(int(self.width() * dpr), 1), max(int(self.height() * dpr), 1)
@@ -107,6 +110,10 @@ class WaveformView(TimelineWidget):
         clip.addRoundedRect(QRectF(0, 0, w, h), CORNER * dpr, CORNER * dpr)
         p.fillPath(clip, theme.LANE_BG)
         p.setClipPath(clip)
+        p.save()
+        p.scale(dpr, dpr)
+        self.paint_grid(p)  # behind the waveform
+        p.restore()
 
         color = QColor(self._color if self._active else theme.INACTIVE)
         mid = h / 2
